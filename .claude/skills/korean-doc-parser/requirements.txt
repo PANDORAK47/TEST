@@ -1,0 +1,17 @@
+# korean-doc-parser + law-go-kr 스킬 파싱 스택
+# 설치: pip install -r requirements.txt
+#      apt install tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng   # 경량 OCR 백업
+
+# 문서 파서
+hwp-hwpx-parser      # .hwp / .hwpx (순수 파이썬, JVM 불필요)
+pymupdf              # .pdf 텍스트 추출 (fitz)
+python-docx          # .docx
+mammoth              # .doc(legacy) raw 텍스트
+
+# 한국어 OCR (스캔 PDF/이미지 폴백) — 공개 FOSS 중 한국어 인식률 최상, CPU 가능
+paddlepaddle
+paddleocr
+pytesseract          # Tesseract(+kor) 경량 백업
+
+# law-go-kr API 클라이언트
+requests
