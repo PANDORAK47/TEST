@@ -37,7 +37,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse, unquote, parse_qs
 
 try:
     import requests
@@ -111,6 +111,20 @@ def search(sess, query, target="admrul", display=20):
                 items = [v]
                 break
     return items
+
+
+def search_annexes(sess, query, display=100):
+    """target=admbyl 로 행정규칙 별표·서식 목록을 직접 조회.
+
+    admrul 본문 파싱 경로가 별표 링크를 못 잡을 때의 대안.
+    (제목, 다운로드URL) 리스트 반환.
+    """
+    data = _get(
+        sess,
+        SEARCH_URL,
+        {"OC": _oc(), "target": "admbyl", "type": "JSON", "query": query, "display": display},
+    )
+    return extract_attachment_links(data)
 
 
 def get_detail(sess, seq, target="admrul"):
@@ -194,11 +208,30 @@ def _sniff_ext(head_bytes, blob):
     return ""
 
 
+def _with_oc(url):
+    """law.go.kr /DRF/ 다운로드 링크에 OC가 없으면 붙인다."""
+    p = urlparse(url)
+    if "law.go.kr" in p.netloc and "/DRF/" in p.path:
+        q = parse_qs(p.query)
+        if "OC" not in q:
+            sep = "&" if p.query else "?"
+            return f"{url}{sep}OC={_oc()}"
+    return url
+
+
 def download(sess, url, outdir, idx=0):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    resp = _get(sess, url, {}, want_json=False)
+    resp = _get(sess, _with_oc(url), {}, want_json=False)
     blob = resp.content
+    # 실제 파일이 아니라 HTML 뷰어 페이지가 온 경우 경고
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if blob[:16].lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml")) and "html" in ctype:
+        print(
+            f"  [경고] {url}\n"
+            "  → 파일이 아니라 HTML 뷰어 페이지가 반환됨. 이 링크는 웹 열람용일 수 있음.",
+            file=sys.stderr,
+        )
     ext = _sniff_ext(blob[:16], blob)
     base = _filename_from_response(resp, f"attachment_{idx}")
     if not Path(base).suffix and ext:
@@ -265,11 +298,39 @@ def _resolve_seq(sess, args):
     return args.seq
 
 
+def _title_of(detail):
+    """상세 JSON에서 법령/규칙 명을 찾아 반환."""
+    found = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if isinstance(v, str) and k.endswith("명") and v.strip():
+                    found.append(v.strip())
+                else:
+                    walk(v)
+        elif isinstance(n, list):
+            for i in n:
+                walk(i)
+
+    walk(detail)
+    return found[0] if found else None
+
+
 def cmd_fetch(args):
     sess = _session()
-    seq = _resolve_seq(sess, args)
-    detail = get_detail(sess, seq, args.target)
-    links = extract_attachment_links(detail)
+    if args.via == "admbyl":
+        query = args.query or args.seq
+        links = search_annexes(sess, query)
+    else:
+        seq = _resolve_seq(sess, args)
+        detail = get_detail(sess, seq, args.target)
+        links = extract_attachment_links(detail)
+        if not links:
+            # 본문에서 못 찾으면 별표 직접 조회로 폴백
+            fallback_q = args.query or _title_of(detail) or str(seq)
+            print(f"[폴백] target=admbyl 로 별표 직접 조회: {fallback_q}", file=sys.stderr)
+            links = search_annexes(sess, fallback_q)
     if not links:
         print("첨부파일 링크 없음")
         return
@@ -305,6 +366,12 @@ def main():
     p.add_argument("--query", help="이름으로 검색해 첫 결과를 사용")
     p.add_argument("--target", default="admrul")
     p.add_argument("--display", type=int, default=20)
+    p.add_argument(
+        "--via",
+        choices=["detail", "admbyl"],
+        default="detail",
+        help="detail=본문 파싱해 별표링크 추출(기본) / admbyl=별표목록 직접 조회",
+    )
     p.add_argument("--outdir", default="./law_attachments")
     p.add_argument("--parse", action="store_true", help="다운로드 후 텍스트 파싱")
     p.add_argument("--grep", help="파싱 결과에서 해당 키워드 포함 줄만 출력")

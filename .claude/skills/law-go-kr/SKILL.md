@@ -55,12 +55,25 @@ python3 $S fetch 2100000279602 --target admrul --outdir ./out --parse --grep 과
 python3 $S fetch --query "식품의 기준 및 규격" --target admrul --parse --grep 과자류
 ```
 
+### 원클릭(로컬 실행)
+```bash
+export LAW_GO_KR_OC=khb
+bash .claude/skills/law-go-kr/scripts/run_local.sh "식품의 기준 및 규격" 과자류
+```
+
 ### target 값
 | target | 대상 |
 |---|---|
 | `admrul` | 행정규칙(고시·훈령·예규) — 식약처 고시 등 |
+| `admbyl` | 행정규칙 별표·서식(첨부파일) 목록 — `--via admbyl` 에서 사용 |
 | `law` | 법률·시행령·시행규칙 |
 | `ordin` | 자치법규 |
+
+### 별표 링크를 못 찾을 때
+`--via admbyl` 로 별표 목록을 직접 조회하는 경로로 폴백한다(자동 폴백도 내장).
+```bash
+python3 law_fetch.py fetch --query "식품의 기준 및 규격" --via admbyl --parse --grep 과자류
+```
 
 ## 동작 원리 (요약)
 

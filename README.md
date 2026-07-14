@@ -40,6 +40,20 @@ S=.claude/skills/law-go-kr/scripts/law_fetch.py
 python3 $S fetch --query "식품의 기준 및 규격" --target admrul --parse --grep 과자류
 ```
 
-> **주의**: Claude Code on the web 의 기본 네트워크 정책은 `www.law.go.kr`
-> 로의 아웃바운드를 차단할 수 있다. 막히면 environment 설정에서 해당 호스트를
-> egress 허용 목록에 추가하거나, law.go.kr 접근이 가능한 로컬/서버에서 실행한다.
+### 원클릭
+```bash
+export LAW_GO_KR_OC=khb
+bash .claude/skills/law-go-kr/scripts/run_local.sh "식품의 기준 및 규격" 과자류
+```
+
+## 실행 환경 (A안 vs B안)
+
+| 방법 | 상태 | 설명 |
+|---|---|---|
+| **A. Claude Code 웹 세션에서 직접** | ❌ 차단됨 | 이 세션의 egress 정책이 `www.law.go.kr` 등 모든 KR 법령/공공 API 호스트를 `403 CONNECT` 로 막는다. environment 설정에서 egress 허용 목록에 `www.law.go.kr` 을 추가해야 열린다(관리자 권한 필요). |
+| **B. law.go.kr 접근 가능한 로컬/서버** | ✅ 사용 가능 | smting MCP가 OC=khb 로 이미 붙고 있는 Mac 등에서 위 원클릭 스크립트를 실행하면 바로 동작한다. **채택된 방법.** |
+
+> 참고: 더 많은 기능(판례·조례·인용 환각 검증 등)이 필요하면 성숙한 오픈소스
+> MCP [`chrisryugj/korean-law-mcp`](https://github.com/chrisryugj/korean-law-mcp)
+> 를 함께 쓸 수 있다(별표 HWP/HWPX 추출 `get_annexes` 내장). 단, 이 MCP도
+> 실행 환경이 law.go.kr 에 접근 가능해야 한다(A안 제약 동일).
