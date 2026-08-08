@@ -244,6 +244,60 @@ class TestExtractAttachments(unittest.TestCase):
         self.assertEqual(extract_attachments(DETAIL_NO_LINKS), [])
 
 
+class TestNestedLinkInheritsOuterContext(unittest.TestCase):
+    """admrul 상세(lawService) 응답의 실제 구조: 별표번호·별표명이 있는 바깥
+    항목과, 실제 파일 링크가 있는 안쪽 리스트가 분리되어 있다. 실제 실행에서
+    모든 별표가 '(번호 미상)' 으로 나온 원인의 회귀 테스트."""
+
+    NESTED_DETAIL = {
+        "행정규칙": {
+            "행정규칙명": "식품등의 표시기준",
+            "별표": [
+                {
+                    "별표번호": "4",
+                    "별표가지번호": "0",
+                    "별표명": "명칭과 용도를 함께 표시하여야 하는 식품첨가물",
+                    "별표파일": [
+                        {"파일명": "명칭과 용도를 함께 표시하여야 하는 식품첨가물", "파일링크": "/LSW/flDownload.do?flSeq=1", "파일종류": "HWP"},
+                        {"파일명": "명칭과 용도를 함께 표시하여야 하는 식품첨가물", "파일PDF링크": "/LSW/flDownload.do?flSeq=2"},
+                    ],
+                },
+                {
+                    "별표번호": "1",
+                    "별표가지번호": "0",
+                    "별표명": "한국인 영양섭취기준",
+                    "별표파일": [
+                        {"파일명": "한국인 영양섭취기준", "파일링크": "/LSW/flDownload.do?flSeq=3"},
+                    ],
+                },
+            ],
+        }
+    }
+
+    def test_inner_link_inherits_outer_number(self):
+        recs = extract_attachments(self.NESTED_DETAIL)
+        refs = {r["ref"] for r in recs}
+        self.assertNotIn(None, refs, "안쪽 링크가 바깥 별표번호를 물려받지 못함")
+        self.assertIn(BylRef("별표", 4, None), refs)
+        self.assertIn(BylRef("별표", 1, None), refs)
+
+    def test_inner_link_keeps_specific_title(self):
+        recs = extract_attachments(self.NESTED_DETAIL)
+        titles = {r["title"] for r in recs}
+        self.assertIn("명칭과 용도를 함께 표시하여야 하는 식품첨가물", titles)
+        self.assertIn("한국인 영양섭취기준", titles)
+
+    def test_three_links_all_resolved(self):
+        recs = extract_attachments(self.NESTED_DETAIL)
+        self.assertEqual(len(recs), 3)
+        self.assertTrue(all(r["ref"] is not None for r in recs))
+
+    def test_flat_structure_still_works(self):
+        # 회귀 방지: admbyl(평면 구조) 픽스처가 여전히 정상 동작해야 한다
+        recs = extract_attachments(ADMBYL_SEARCH)
+        self.assertTrue(all(r["ref"] is not None for r in recs))
+
+
 class TestBylFilter(unittest.TestCase):
     # 픽스처 링크 구성: 별표1 = HTML+파일(2), 별표4 = HTML+파일+PDF(3),
     #                  별표4의2 = 파일(1)  → 총 6건

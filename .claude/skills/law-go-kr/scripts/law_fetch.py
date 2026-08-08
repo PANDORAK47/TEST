@@ -148,16 +148,23 @@ def extract_attachments(payload) -> list[dict]:
 
     반환: [{"title", "url", "ref": BylRef|None, "fmt": "파일"|"PDF"|"HTML"}]
     필드명이 API 버전마다 달라, (키에 링크/파일 포함) & (값이 URL/경로) 를 후보로 본다.
+
+    admrul 상세(lawService) 응답은 admbyl 검색과 구조가 다르다 — 별표번호·별표명이
+    있는 바깥 항목과, 실제 파일 링크가 있는 안쪽 항목(예: 파일 목록) 이 분리되어
+    있을 수 있다. 안쪽 dict 만 보고 title/ref 를 새로 계산하면 바깥의 별표번호를
+    잃어버려 모든 항목이 '번호 미상' 이 된다(실제로 겪은 버그). 그래서 상위에서
+    찾은 title/ref/owner 를 컨텍스트로 들고 내려가 안쪽에 없으면 물려받는다.
     """
     out: list[dict] = []
     seen: set[str] = set()
 
-    def walk(node):
+    def walk(node, ctx: dict):
         if isinstance(node, dict):
-            title = _title_of(node)
-            ref = byl_ref_from_item(node)
-            owner = _field(node, "관련행정규칙명", "관련법령명")
-            owner_seq = _field(node, "관련행정규칙일련번호", "관련법령ID")
+            title = _title_of(node) or ctx.get("title")
+            ref = byl_ref_from_item(node) or ctx.get("ref")
+            owner = _field(node, "관련행정규칙명", "관련법령명") or ctx.get("owner")
+            owner_seq = _field(node, "관련행정규칙일련번호", "관련법령ID") or ctx.get("owner_seq")
+            child_ctx = {"title": title, "ref": ref, "owner": owner, "owner_seq": owner_seq}
             for k, v in node.items():
                 if isinstance(v, str) and LINK_KEY_RE.search(k) and PATH_RE.match(v.strip()):
                     url = urljoin(HOST, v.strip())
@@ -175,12 +182,12 @@ def extract_attachments(payload) -> list[dict]:
                         }
                     )
                 else:
-                    walk(v)
+                    walk(v, child_ctx)
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, ctx)
 
-    walk(payload)
+    walk(payload, {})
     return out
 
 
