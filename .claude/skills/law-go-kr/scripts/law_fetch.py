@@ -342,7 +342,8 @@ def pick_best_match(items: list[dict], query: str, target: str = "") -> tuple[di
 def resolve_seq(client: LawClient, args) -> str:
     """--query 가 있으면 검색해 가장 잘 맞는 결과의 일련번호를 쓴다."""
     if getattr(args, "query", None):
-        items = search_items(client.search(args.query, args.target, args.display))
+        payload = client.search(args.query, args.target, args.display, getattr(args, "page", 1))
+        items = search_items(payload)
         if not items:
             sys.exit(f"'{args.query}' 검색 결과가 없습니다. --target 을 확인하세요(law/admrul/ordin).")
 
@@ -532,9 +533,31 @@ def parse_file(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def total_count(payload) -> int | None:
+    """검색 응답의 전체 결과 건수(totalCnt)를 찾는다.
+
+    표시된 개수보다 totalCnt 가 크면 나머지는 화면에 안 보일 뿐 사라진
+    게 아니다 — 아무 신호 없이 그냥 잘려 있으면 사용자는 그 사실 자체를
+    모른다(실제로 "식품" 검색이 448건 중 20건만 보여주면서 그 사실을
+    전혀 알리지 않는 것을 확인했다).
+    """
+    if not isinstance(payload, dict) or not payload:
+        return None
+    root = next(iter(payload.values()), None)
+    if isinstance(root, dict):
+        for k, v in root.items():
+            if "totalCnt" in k or "totalCount" in k:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
 def cmd_search(args):
     client = make_client(args)
-    items = search_items(client.search(args.query, args.target, args.display))
+    payload = client.search(args.query, args.target, args.display, args.page)
+    items = search_items(payload)
     if not items:
         print("검색 결과 없음")
         return
@@ -543,6 +566,14 @@ def cmd_search(args):
         return
     for it in items:
         print(f"{item_seq(it, args.target) or '?'}\t{item_name(it, args.target)}")
+    total = total_count(payload)
+    if total is not None and total > len(items) and not args.quiet:
+        shown_from = (args.page - 1) * args.display + 1
+        print(
+            f"\n[{shown_from}~{shown_from + len(items) - 1}번째 표시, 전체 {total}건] "
+            f"--page {args.page + 1} 로 다음 페이지, --display 로 더 많이 보기",
+            file=sys.stderr,
+        )
 
 
 def cmd_annexes(args):
@@ -811,6 +842,7 @@ def add_common(p, *, need_target=True):
     if need_target:
         p.add_argument("--target", default="admrul", help="law | admrul | ordin (기본 admrul)")
         p.add_argument("--display", type=int, default=20)
+        p.add_argument("--page", type=int, default=1, help="검색 결과 페이지(기본 1)")
     p.add_argument("--format", choices=["text", "json", "markdown"], default="text")
     p.add_argument("--no-cache", action="store_true", help="캐시를 읽지도 쓰지도 않음")
     p.add_argument("--refresh", action="store_true", help="캐시를 무시하고 새로 받아 갱신")

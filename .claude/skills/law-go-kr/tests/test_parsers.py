@@ -16,6 +16,7 @@ from parsers import (  # noqa: E402
     articles_to_kb_entries,
     articles_to_markdown,
     articles_to_text,
+    break_before_circled,
     byl_matches,
     byl_ref_from_item,
     extract_articles,
@@ -445,6 +446,207 @@ class TestRealLawDetailResponse(unittest.TestCase):
         self.assertNotIn("① ①", out)
         self.assertNotIn("1. 1.", out)
         self.assertNotIn("제1장", out)
+
+
+# 실제 lawService.do 응답에서 그대로 옮긴 픽스처들 (OC=test 로 조회).
+# 세 곳의 서로 다른 부처/타겟에서 확인된 함정을 담고 있다.
+
+# admrul, ID=2100000238426 (강원지방우정청 위임전결규정): 조문내용이 문자열
+# 하나가 아니라 '조문별 문자열의 리스트' 로 온다.
+REAL_ADMRUL_LIST_BODY = {
+    "AdmRulService": {
+        "조문내용": [
+            "제1조(목적) 이 규정은「행정효율과 협업촉진에 관한 규정」제10조 제2항에 따라 "
+            "강원지방우정청의 소관업무 중 일상적이고 경미한 사항에 관한 업무처리를 보조(보좌)"
+            "기관에 위임 전결하게 함으로써 권한과 책임을 분명히 하고 업무처리에 신속을 기함을 "
+            "목적으로 한다.",
+            "제2조(적용범위) 강원지방우정청의 보조(보좌)기관에 대한 위임전결사항은 다른 법령에 "
+            "별도 규정이 있는 것을 제외하고는 이 규정에 따른다.",
+            "제3조(전결권자의 구분) 이 규정에서의 전결권자는 국장, 감사관, 과장 및 담당으로 "
+            "구분한다.",
+        ]
+    }
+}
+
+# admrul, ID=2100000279014 (식품등의 표시기준): 조문내용이 "제N조" 가 아니라
+# Ⅰ./1./가. 개요식 번호로 된 53KB 단일 문자열. 줄바꿈도 전혀 없다.
+REAL_ADMRUL_OUTLINE_BODY = {
+    "AdmRulService": {
+        "조문내용": (
+            "Ⅰ. 총   칙1. 목  적이 고시는「식품 등의 표시ㆍ광고에 관한 법률」제4조 및 제5조, "
+            "같은 법 시행규칙 제5조제3항, 제5조의2 및 제6조제4항에 따라 식품, 축산물, 식품첨가물, "
+            "기구 또는 용기ㆍ포장의 표시기준에 관한 사항, 소비자 안전을 위한 주의사항 및 영양성분 "
+            "표시대상 식품의 영양표시에 관하여 필요한 사항을 규정함으로써 위생적인 취급을 도모하고 "
+            "소비자에게 정확한 정보를 제공하며 공정한 거래의 확보를 목적으로 한다.2. 구  성가. "
+            "이 고시는 총칙, 공통표시기준, 개별표시사항 및 표시기준, 별지 1 표시사항별 세부표시기준"
+        )
+    }
+}
+
+# ordin, ID=2019771 (가평군 보건소 수가 조례): 조문.조[] 형태(조문단위 아님),
+# 조내용에 줄바꿈이 전혀 없어 항이 한 줄로 뭉개진다. 부칙내용도 같은 응답에
+# 있어 조문 blob 수집기가 잘못 끌어올 위험이 있다.
+REAL_ORDIN_BODY = {
+    "자치법규정보": {
+        "부칙": {
+            "부칙내용": (
+                "부칙  이 조례는 공포한 날부터 시행한다.부칙 <2007.11.9. 조례 제1959호> "
+                "①(시행일) 이 조례는 공포한 날부터 시행한다.②(다른 조례의 개정)"
+            )
+        },
+        "조문": {
+            "조": [
+                {
+                    "조문번호": ["000100", "000100"],
+                    "조제목": "목적",
+                    "조내용": "제1조(목적) 이 조례는 진료비 및 수수료의 징수에 필요한 사항을 규정함을 목적으로 한다.",
+                    "조문여부": "Y",
+                },
+                {
+                    "조문번호": ["000800", "000800"],
+                    "조제목": "진료비 및 수수료 감면",
+                    "조내용": (
+                        "제8조(진료비 및 수수료 감면)① 보건소장은 공익상 필요로 할 경우나 특별한 "
+                        "사유가 있는 사람에 대해서는 진료비 및 수수료를 감면할 수 있다.② 제1항에 "
+                        "따른 진료비 및 수수료 전액 감면대상은 다음 각 호와 같다.1. 감염병 예방에 "
+                        "필요한 경우2. 수해 또는 재해 발생지역 주민진료 및 예방접종"
+                    ),
+                    "조문여부": "Y",
+                },
+            ]
+        },
+    }
+}
+
+
+class TestExtractArticlesRealWorldShapes(unittest.TestCase):
+    """실사용 재현 리뷰에서 실제 API 응답으로 확인된 3개 버그의 회귀 테스트."""
+
+    def test_list_shaped_body_recovers_all_articles(self):
+        # Finding 1: 조문내용이 리스트면 통째로 무시돼 0개가 나오던 버그
+        arts = extract_articles(REAL_ADMRUL_LIST_BODY)
+        self.assertEqual([a["번호"] for a in arts], ["1", "2", "3"])
+        self.assertIn("위임 전결", arts[0]["내용"])
+
+    def test_outline_body_returns_content_not_empty(self):
+        # Finding 2: "제N조" 가 아닌 개요식 본문을 빈 것처럼 보고하던 버그.
+        # 구조를 억지로 만들어내지 않고, 원문 그대로를 번호 없는 조문 하나로
+        # 돌려줘야 한다 — "본문이 비어 있다" 는 이 문서에 대해 명백히 거짓이다.
+        arts = extract_articles(REAL_ADMRUL_OUTLINE_BODY)
+        self.assertTrue(arts, "실제 53KB 본문이 있는데 빈 리스트를 반환함")
+        self.assertIsNone(arts[0]["번호"])
+        self.assertIn("총   칙", arts[0]["내용"])
+        self.assertIn("영양표시", arts[0]["내용"])
+
+    def test_ordin_shape_recovers_articles_without_buchik_contamination(self):
+        # Finding 3 (일부): 조문.조[] 형태를 인식하고, 부칙내용이 번호 없는
+        # 가짜 조문으로 섞여 들어오지 않아야 한다.
+        arts = extract_articles(REAL_ORDIN_BODY)
+        numbers = [a["번호"] for a in arts]
+        self.assertIn("1", numbers)
+        self.assertIn("8", numbers)
+        self.assertNotIn(None, numbers, "부칙내용이 번호 없는 유령 조문으로 섞여 들어옴")
+        joined_all = " ".join(a["내용"] for a in arts)
+        self.assertNotIn("공포한 날부터 시행", joined_all, "부칙 텍스트가 조문에 섞여 들어옴")
+
+    def test_ordin_shape_recovers_paragraph_structure(self):
+        # Finding 3 (일부): 줄바꿈 없는 조내용에서도 원문자(①②) 기준으로
+        # 항이 최소한 분리돼야 한다(호까지는 아니어도).
+        arts = extract_articles(REAL_ORDIN_BODY)
+        art8 = next(a for a in arts if a["번호"] == "8")
+        text = art8["내용"] if not art8["항"] else " ".join(p["내용"] for p in art8["항"])
+        # 최소 요건: 항이 아예 안 갈라져 모든 내용이 한 덩어리인 예전 버그는
+        # 벗어났는지 — 항 목록이 있으면 2개 이상이어야 한다.
+        if art8["항"]:
+            self.assertGreaterEqual(len(art8["항"]), 2)
+
+
+class TestBreakBeforeCircled(unittest.TestCase):
+    def test_inserts_newline_before_inline_marker(self):
+        out = break_before_circled("감면할 수 있다.② 제1항에 따른")
+        self.assertIn("있다.\n②", out)
+
+    def test_idempotent_on_already_separated_text(self):
+        text = "제1조\n① 첫째\n② 둘째"
+        out = break_before_circled(text)
+        self.assertEqual(out.replace("\n\n", "\n"), text)
+
+    def test_no_change_without_circled_chars(self):
+        text = "평범한 문장입니다."
+        self.assertEqual(break_before_circled(text), text)
+
+
+class TestHoWithBranchNumber(unittest.TestCase):
+    """Finding 4: 정규식 폴백 경로에서 '1의2.' 같은 가지번호 호가 앞 호에
+    잘못 흡수되던 버그."""
+
+    def test_branch_numbered_ho_recognized_separately(self):
+        text = "제10조(적용범위) 다음 각 호에 대하여 적용한다.\n1. 과자류\n1의2. 초콜릿류\n2. 캔디류\n"
+        arts = parse_articles(text)
+        hos = arts[0]["항"][0]["호"]
+        self.assertEqual([h["번호"] for h in hos], ["1", "1의2", "2"])
+
+    def test_branch_ho_content_not_merged_into_prior(self):
+        text = "제10조(적용범위) 적용한다.\n1. 과자류\n1의2. 초콜릿류\n"
+        arts = parse_articles(text)
+        hos = arts[0]["항"][0]["호"]
+        self.assertEqual(hos[0]["내용"], "과자류")
+        self.assertEqual(hos[1]["내용"], "초콜릿류")
+
+
+class TestParagraphsBeyondTwenty(unittest.TestCase):
+    """Finding 5: ㉑(21번째) 이상 원문자 항이 인식되지 않던 버그."""
+
+    def test_paragraph_21_and_22_recognized(self):
+        text = "제5조(항목) 다음과 같다.\n㉑ 스물한번째 항이다.\n㉒ 스물두번째 항이다.\n"
+        arts = parse_articles(text)
+        self.assertEqual(len(arts[0]["항"]), 2)
+        self.assertEqual(arts[0]["항"][0]["내용"], "스물한번째 항이다.")
+
+    def test_para_label_renders_beyond_twenty(self):
+        self.assertEqual(para_label(21), "㉑")
+        self.assertEqual(para_label(50), "㊿")
+
+
+class TestZeroBranchTreatedAsNone(unittest.TestCase):
+    """Finding 7: 조문가지번호="0" 이 '가지 없음' 을 뜻하는데, 문자열이라
+    truthy 라서 그대로 두면 "제5조의0" 같은 존재하지 않는 조문이 생긴다."""
+
+    def test_zero_branch_becomes_none(self):
+        detail = {
+            "법령": {
+                "조문": {
+                    "조문단위": [
+                        {
+                            "조문번호": "5",
+                            "조문가지번호": "0",
+                            "조문제목": "테스트",
+                            "조문내용": "제5조(테스트) 가지번호 0 테스트 본문입니다 40자 넘기기.",
+                        }
+                    ]
+                }
+            }
+        }
+        arts = extract_articles(detail)
+        self.assertIsNone(arts[0]["가지"])
+
+    def test_real_branch_still_recognized(self):
+        detail = {
+            "법령": {
+                "조문": {
+                    "조문단위": [
+                        {
+                            "조문번호": "5",
+                            "조문가지번호": "2",
+                            "조문제목": "테스트",
+                            "조문내용": "제5조의2(테스트) 가지번호 2 테스트 본문입니다 40자 넘기기.",
+                        }
+                    ]
+                }
+            }
+        }
+        arts = extract_articles(detail)
+        self.assertEqual(arts[0]["가지"], "2")
 
 
 class TestApiErrorEnvelope(unittest.TestCase):

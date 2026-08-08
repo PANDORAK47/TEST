@@ -194,15 +194,25 @@ def byl_ref_from_item(item: dict) -> BylRef | None:
 # 2. 조문 구조화 (조 / 항 / 호 / 목)
 # ---------------------------------------------------------------------------
 
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+# ①~⑳(1-20) 뿐 아니라 ㉑~㉟(21-35, U+3251~325F), ㊱~㊿(36-50, U+32B1~32BF)
+# 까지 커버한다. 20개까지만 인식하면 21번째 이후 항이 전부 조문 본문에
+#뭉개진다(실제로 21개짜리 항목으로 구성된 조문에서 재현된 문제).
+CIRCLED = (
+    "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+    + "".join(chr(c) for c in range(0x3251, 0x3260))  # ㉑-㉟
+    + "".join(chr(c) for c in range(0x32B1, 0x32C0))  # ㊱-㊿
+)
 _CIRCLED_VALUE = {ch: i + 1 for i, ch in enumerate(CIRCLED)}
 _MOK_LETTERS = "가나다라마바사아자차카타파하"
 
 _ART_RE = re.compile(r"^\s*제\s*(\d+)\s*조\s*(?:의\s*(\d+))?\s*(?:\(([^)]*)\))?\s*(.*)$")
 _PARA_CIRCLED_RE = re.compile(rf"^\s*([{CIRCLED}])\s*(.*)$")
 _PARA_PAREN_RE = re.compile(r"^\s*\((\d{1,2})\)\s*(.*)$")
-_HO_RE = re.compile(r"^\s*(\d{1,2})\s*\.\s*(.*)$")
+# "1의2." 처럼 가지번호가 붙은 호도 인식한다 — 마침표 직전 숫자만 보던
+# 예전 패턴은 "1의2." 를 통째로 못 알아보고 앞 호의 내용에 붙여버렸다.
+_HO_RE = re.compile(r"^\s*(\d{1,2}(?:의\d{1,2})?)\s*\.\s*(.*)$")
 _MOK_RE = re.compile(rf"^\s*([{_MOK_LETTERS}])\s*\.\s*(.*)$")
+_CIRCLED_INLINE_RE = re.compile(rf"(?<!^)(?=[{CIRCLED}])")
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
@@ -217,6 +227,22 @@ def strip_markup(text: str) -> str:
     for ent, ch in (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"), ("&quot;", '"'), ("&nbsp;", " ")):
         text = text.replace(ent, ch)
     return text
+
+
+def break_before_circled(text: str) -> str:
+    """원문자(①②③...) 앞에 줄바꿈이 없으면 넣는다.
+
+    일부 응답(예: 자치법규 target=ordin)은 조문 하나의 전체 텍스트가
+    줄바꿈 없이 한 줄로 온다 — "...할 수 있다.② 제1항에 따른..." 처럼
+    항이 이어 붙어 있어서, 줄 단위로 동작하는 parse_articles 가 항을
+    하나도 못 알아본다(실제로 5개 항이 있는 조문이 0개 항으로 나온 사례).
+
+    원문자는 한국 법령 표기에서 거의 예외 없이 항의 시작에만 쓰이므로
+    ("가.", "1." 과 달리 날짜·목록 등 다른 문맥과 헷갈릴 여지가 없다),
+    이 문자 앞에서 줄을 나누는 것은 안전하다. 이미 줄 앞에 있는 경우는
+    빈 줄만 하나 늘어나고 parse_articles 가 빈 줄을 건너뛰므로 무해하다.
+    """
+    return _CIRCLED_INLINE_RE.sub("\n", text)
 
 
 def parse_articles(text: str) -> list[dict]:
@@ -465,7 +491,12 @@ def extract_articles(detail: dict) -> list[dict]:
                 return default
 
             num = g("조문번호", default=None) or None
-            branch = g("조문가지번호", default=None) or None
+            branch_raw = g("조문가지번호", default=None)
+            # "0" 은 '가지 없음' 을 뜻하는 값이지 진짜 가지번호가 아니다.
+            # 이걸 그대로 두면 truthy 라서 "제5조의0" 같은 존재하지 않는
+            # 조문이 생긴다 — 별표번호(0패딩)·부서명 우선순위에서 이미
+            # 겪은 것과 같은 종류의 "문자열이라 falsy 검사가 안 먹는" 버그.
+            branch = branch_raw if branch_raw not in (None, "", "0") else None
             title = g("조문제목", default=None) or None
 
             paras: list[dict] = []
@@ -485,12 +516,85 @@ def extract_articles(detail: dict) -> list[dict]:
             )
         return out
 
-    blobs = []
+    return _extract_from_text_blobs(detail)
+
+
+# 조문 본문이 아닌 필드는 '내용' 이 들어가도 blob 수집에서 제외한다.
+# 실제로 겪은 문제: '부칙내용' 필드(수십 년치 개정이력 텍스트)가 이
+# 제외 목록 없이 조문 blob 과 함께 수집돼, 부칙 앞부분이 번호 없는
+# 가짜 조문으로 둔갑했다(자치법규 target=ordin 에서 재현).
+_BLOB_EXCLUDE = ("부칙", "제개정이유", "관련")
+
+
+def _extract_from_text_blobs(detail: dict) -> list[dict]:
+    """구조화된 조문단위가 없을 때, 텍스트 blob 을 모아 정규식으로 파싱한다.
+
+    두 가지를 추가로 처리한다:
+    1) 조문내용이 문자열이 아니라 '조별 문자열의 리스트' 로 오는 응답이
+       있다(여러 부처의 admrul 상세에서 확인) — 그대로 두면
+       isinstance(v, str) 검사에 걸려 통째로 무시되고 "본문이 비어
+       있다" 는 잘못된 안내가 나간다. 리스트면 줄바꿈으로 합쳐 하나의
+       blob 취급한다.
+    2) 그래도 정규식이 "제N조" 구조를 하나도 못 찾았는데 원문 텍스트
+       자체는 충분히 긴 경우(예: "Ⅰ.총칙 1.목적 가. ..." 같은 개요식
+       고시 본문 — 「식품등의 표시기준」실제 사례), 빈 리스트를 돌려주면
+       "본문이 비어 있다" 는 완전히 틀린 메시지가 나간다. 이럴 땐 구조를
+       억지로 지어내지 않고, 번호 없는 원문 그대로를 조문 하나로 감싸
+       돌려준다 — 있는 내용을 없다고 하지 않는 것이 우선이다.
+    """
+    # 1순위: 실제로 확인된 조문 본문 필드명과 정확히 일치하면 길이 제한 없이
+    # 그대로 믿는다. 짧아도(예: "이 조례 시행에 필요한 사항은 규칙으로
+    # 정한다" — 37자) 진짜 조문이면 온전히 살려야 한다 — 아래 2순위의
+    # 길이 임계값(>40자)을 여기에도 적용하면 짧고 정상적인 조문이
+    # 통째로 빠진다(실제로 겪은 문제, 자치법규 제11조).
+    _EXACT_BODY_KEYS = ("조문내용", "조내용")
+    blobs: list[str] = []
     for d in _iter_dicts(detail):
         for k, v in d.items():
-            if isinstance(v, str) and ("조문" in k or "내용" in k) and len(v) > 40:
+            if k in _EXACT_BODY_KEYS and isinstance(v, str) and v.strip():
                 blobs.append(v)
-    return parse_articles("\n".join(blobs)) if blobs else []
+            elif (
+                k in _EXACT_BODY_KEYS
+                and isinstance(v, list)
+                and v
+                and all(isinstance(x, str) for x in v)
+            ):
+                blobs.append("\n".join(x for x in v if x))
+
+    # 2순위: 정확히 일치하는 필드가 없으면(아직 못 본 target 형태 등),
+    # '조문'/'내용' 이 들어간 필드를 넓게 훑되 — 넓게 훑는 만큼 길이
+    # 임계값으로 짧은 메타데이터(코드·번호 리스트 등)를 걸러낸다.
+    # 실제로 "조문번호":["000100","000100"] 같은 코드 리스트가 '조문'
+    # 부분문자열에 걸려 유령 조문으로 샌 적이 있다.
+    if not blobs:
+        for d in _iter_dicts(detail):
+            for k, v in d.items():
+                if any(x in k for x in _BLOB_EXCLUDE):
+                    continue
+                if isinstance(v, str) and ("조문" in k or "내용" in k) and len(v) > 40:
+                    blobs.append(v)
+                elif (
+                    isinstance(v, list)
+                    and ("조문" in k or "내용" in k)
+                    and v
+                    and all(isinstance(x, str) for x in v)
+                ):
+                    joined_list = "\n".join(x for x in v if x)
+                    if len(joined_list) > 40:
+                        blobs.append(joined_list)
+
+    if not blobs:
+        return []
+
+    joined = "\n".join(blobs)
+    arts = parse_articles(break_before_circled(joined))
+    if arts:
+        return arts
+
+    raw = strip_markup(joined).strip()
+    if len(raw) > 40:
+        return [{"번호": None, "가지": None, "제목": None, "내용": raw, "항": []}]
+    return []
 
 
 def filter_articles(articles: list[dict], spec: str | None) -> list[dict]:
