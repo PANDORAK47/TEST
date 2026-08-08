@@ -80,8 +80,41 @@ CODEX_CATEGORY = {
     "equipment": "기구 및 용기·포장공전",
 }
 
+# import 이름과 pip 패키지 이름이 다른 것들 — 안내에 틀린 명령을 주지 않도록
+PIP_NAME = {
+    "PIL": "pillow",
+    "docx": "python-docx",
+    "fitz": "pymupdf",
+    "cv2": "opencv-python",
+    "yaml": "PyYAML",
+    "sklearn": "scikit-learn",
+    "hwp_hwpx_parser": "hwp-hwpx-parser",
+}
+
 LINK_KEY_RE = re.compile(r"(링크|파일|다운로드)", re.I)
 PATH_RE = re.compile(r"^(https?://|/)")
+
+
+def probe_module(mod: str, _import=None) -> tuple[bool, str]:
+    """모듈이 실제로 import 되는지 확인한다.
+
+    '미설치'와 '설치됐지만 전이 의존성 누락'을 구분한다 — 이미 설치한 사람에게
+    '설치하세요'라고 안내하면 헛돌게 되기 때문이다. pip 패키지명이 import 명과
+    다른 경우(PIL→pillow 등)도 올바른 명령을 안내한다.
+
+    _import 는 테스트에서 주입하기 위한 훅이다.
+    """
+    importer = _import or __import__
+    try:
+        importer(mod)
+        return True, ""
+    except ImportError as exc:
+        missing = (getattr(exc, "name", "") or "").split(".")[0]
+        if missing and missing != mod.split(".")[0]:
+            return False, f"설치됨, 의존성 '{missing}' 누락 → pip install {PIP_NAME.get(missing, missing)}"
+        return False, f"미설치 → pip install {PIP_NAME.get(mod, mod)}"
+    except Exception as exc:
+        return False, f"import 실패: {type(exc).__name__}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +501,99 @@ def cmd_export(args):
     print(f"[저장] {out_path} — 추가 {added}건 / 갱신 {updated}건")
 
 
+def cmd_doctor(args):
+    """설치·인증·네트워크·파싱 의존성을 한 번에 점검한다.
+
+    이 스킬은 막히는 지점이 여럿이라(egress 차단, OC 미설정, IP 미등록,
+    파서 누락) 어디서 걸렸는지 바로 짚어주는 편이 낫다.
+    """
+    rows: list[tuple[str, str, str]] = []  # (항목, 상태, 설명)
+
+    def add(label, ok, detail=""):
+        rows.append((label, {True: "OK", False: "FAIL", None: "WARN"}[ok], detail))
+
+    # 1. 파이썬 / requests
+    add("Python", True, f"{sys.version.split()[0]}")
+    try:
+        import requests as _rq
+
+        add("requests", True, _rq.__version__)
+    except ImportError:
+        add("requests", False, "pip install requests")
+
+    # 2. 인증키
+    oc = (getattr(args, "oc", None) or __import__("os").environ.get("LAW_GO_KR_OC", "")).strip()
+    add("OC 인증키", bool(oc), f"{oc[:2]}***" if oc else "export LAW_GO_KR_OC=<발급받은 아이디>")
+
+    # 3. 네트워크 도달
+    net_ok = False
+    try:
+        import requests as _rq
+
+        r = _rq.get(HOST, timeout=(5, 15))
+        net_ok = r.ok
+        add("law.go.kr 접속", net_ok, f"HTTP {r.status_code}")
+    except Exception as exc:
+        add(
+            "law.go.kr 접속",
+            False,
+            f"{type(exc).__name__} — egress 정책이 www.law.go.kr 을 막고 있을 수 있음",
+        )
+
+    # 4. API 인증(실호출) — 여기가 IP 등록 여부를 가르는 지점
+    if oc and net_ok:
+        try:
+            client = LawClient(oc=oc, use_cache=False, retries=1, verbose=False)
+            items = search_items(client.search("식품", "admrul", display=1))
+            add("API 인증", bool(items), f"검색 결과 {len(items)}건" if items else "결과 0건")
+        except NetworkBlockedError:
+            add("API 인증", False, "네트워크 차단")
+        except LawApiError as exc:
+            first = str(exc).splitlines()[0]
+            add("API 인증", False, f"{first} → OC 키 또는 호출 IP 등록 확인")
+    else:
+        add("API 인증", None, "OC 또는 네트워크가 준비되지 않아 건너뜀")
+
+    # 5. 문서 파서
+    add("korean-doc-parser", PARSER.exists(), str(PARSER) if PARSER.exists() else f"없음: {PARSER}")
+    for mod, why in (
+        ("hwp_hwpx_parser", ".hwp/.hwpx"),
+        ("pymupdf", ".pdf"),
+        ("docx", ".docx"),
+        ("mammoth", ".doc"),
+    ):
+        ok, detail = probe_module(mod)
+        add(f"  {mod}", ok, why if ok else f"{why} 파싱 불가 — {detail}")
+    for mod in ("paddleocr", "pytesseract"):
+        ok, detail = probe_module(mod)
+        add(f"  {mod}", True if ok else None, "스캔 PDF OCR" if ok else f"선택 사항 — {detail}")
+
+    # 6. 캐시 쓰기 가능 여부
+    cache_root = Path(getattr(args, "cache_dir", DEFAULT_CACHE_DIR))
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        probe = cache_root / ".write-probe"
+        probe.write_text("x")
+        probe.unlink()
+        add("캐시 디렉터리", True, str(cache_root))
+    except OSError as exc:
+        add("캐시 디렉터리", False, f"{cache_root} 쓰기 불가 — {exc}")
+
+    if args.format == "json":
+        print(json.dumps([{"항목": a, "상태": b, "설명": c} for a, b, c in rows], ensure_ascii=False, indent=2))
+    else:
+        mark = {"OK": "✅", "FAIL": "❌", "WARN": "⚠️ "}
+        width = max(len(a) for a, _, _ in rows)
+        for label, status, detail in rows:
+            print(f"{mark[status]} {label.ljust(width)}  {detail}")
+
+    failed = [a.strip() for a, s, _ in rows if s == "FAIL"]
+    if failed:
+        print(f"\n문제 {len(failed)}건: {', '.join(failed)}", file=sys.stderr)
+        sys.exit(1)
+    print("\n모든 점검을 통과했습니다.", file=sys.stderr)
+
+
 def cmd_cache(args):
     cache = Cache(Path(args.cache_dir), ttl=args.ttl if args.ttl is not None else DEFAULT_TTL)
     if args.action == "clear":
@@ -563,6 +689,12 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="쓰지 않고 미리보기만")
     add_common(p)
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("doctor", help="설치·인증·네트워크·의존성 한 번에 점검")
+    p.add_argument("--oc")
+    p.add_argument("--format", choices=["text", "json"], default="text")
+    p.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("cache", help="캐시 정보 확인/삭제")
     p.add_argument("action", choices=["info", "clear"], nargs="?", default="info")

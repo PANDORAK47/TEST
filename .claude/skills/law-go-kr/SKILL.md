@@ -67,6 +67,17 @@ law-go-kr/
 ```bash
 S=.claude/skills/law-go-kr/scripts/law_fetch.py
 
+# 0) 설정 점검 — 새 PC 에서 제일 먼저 실행할 것
+python3 $S doctor
+#  ✅ Python             3.11.15
+#  ✅ requests           2.33.1
+#  ✅ OC 인증키            kh***
+#  ✅ law.go.kr 접속       HTTP 200
+#  ✅ API 인증             검색 결과 1건
+#  ✅ korean-doc-parser  .../parse_doc.py
+#  ✅   hwp_hwpx_parser  .hwp/.hwpx
+#  ...
+
 # 1) 검색 → 행정규칙일련번호 확인
 python3 $S search "식품등의 표시기준"
 
@@ -96,6 +107,14 @@ python3 $S cache clear
 export LAW_GO_KR_OC=your_oc_id
 bash .claude/skills/law-go-kr/scripts/run_local.sh "식품등의 표시기준" "" "별표 4"
 ```
+
+## 설정 점검 (`doctor`)
+
+막히는 지점이 여럿이라(egress 차단 · OC 미설정 · IP 미등록 · 파서 누락) 한 번에
+어디가 문제인지 짚어준다. 실패한 항목이 있으면 종료코드 1.
+
+`설치됨, 의존성 'cobble' 누락` 처럼 **'미설치'와 '전이 의존성 누락'을 구분**하고,
+pip 패키지명이 import 명과 다르면(`PIL` → `pillow`) 올바른 명령을 안내한다.
 
 ## 별표 지정 문법 (`--byl`)
 

@@ -304,6 +304,59 @@ class TestDownloadNaming(unittest.TestCase):
             self.assertEqual(p.suffix, ".pdf")
 
 
+class TestProbeModule(unittest.TestCase):
+    """'미설치'와 '의존성 누락'을 구분해야 한다 — 이미 설치한 사람에게
+    '설치하세요'라고 하면 헛돌게 된다(실제로 mammoth 에서 겪은 상황)."""
+
+    def test_importable_module(self):
+        from law_fetch import probe_module
+
+        ok, detail = probe_module("json")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+    def test_missing_module(self):
+        from law_fetch import probe_module
+
+        def boom(name):
+            raise ImportError(f"No module named {name!r}", name=name)
+
+        ok, detail = probe_module("nope_xyz", _import=boom)
+        self.assertFalse(ok)
+        self.assertIn("미설치", detail)
+
+    def test_missing_transitive_dependency(self):
+        from law_fetch import probe_module
+
+        def boom(_name):
+            raise ImportError("No module named 'cobble'", name="cobble")
+
+        ok, detail = probe_module("mammoth", _import=boom)
+        self.assertFalse(ok)
+        self.assertIn("설치됨", detail)
+        self.assertIn("cobble", detail)
+
+    def test_pip_name_differs_from_import_name(self):
+        from law_fetch import probe_module
+
+        def boom(_name):
+            raise ImportError("No module named 'PIL'", name="PIL")
+
+        _, detail = probe_module("pytesseract", _import=boom)
+        self.assertIn("pip install pillow", detail)  # 'pip install PIL' 은 틀린 명령
+        self.assertNotIn("pip install PIL", detail)
+
+    def test_non_import_error_reported(self):
+        from law_fetch import probe_module
+
+        def boom(_name):
+            raise RuntimeError("초기화 실패")
+
+        ok, detail = probe_module("weird", _import=boom)
+        self.assertFalse(ok)
+        self.assertIn("RuntimeError", detail)
+
+
 class TestKbFileRoundTrip(unittest.TestCase):
     """export 가 쓰는 지식베이스 파일 형식이 food-code-analyzer 와 호환되는지."""
 
