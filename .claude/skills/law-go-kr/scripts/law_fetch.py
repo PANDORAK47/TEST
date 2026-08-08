@@ -156,6 +156,8 @@ def extract_attachments(payload) -> list[dict]:
         if isinstance(node, dict):
             title = _title_of(node)
             ref = byl_ref_from_item(node)
+            owner = _field(node, "관련행정규칙명", "관련법령명")
+            owner_seq = _field(node, "관련행정규칙일련번호", "관련법령ID")
             for k, v in node.items():
                 if isinstance(v, str) and LINK_KEY_RE.search(k) and PATH_RE.match(v.strip()):
                     url = urljoin(HOST, v.strip())
@@ -163,7 +165,14 @@ def extract_attachments(payload) -> list[dict]:
                         continue
                     seen.add(url)
                     out.append(
-                        {"title": title or k, "url": url, "ref": ref, "fmt": classify_link(k, url)}
+                        {
+                            "title": title or k,
+                            "url": url,
+                            "ref": ref,
+                            "fmt": classify_link(k, url),
+                            "owner": owner,
+                            "owner_seq": owner_seq,
+                        }
                     )
                 else:
                     walk(v)
@@ -202,8 +211,26 @@ def item_name(item: dict) -> str:
     return str(_field(item, "명", default="?"))
 
 
-def item_seq(item: dict) -> str | None:
-    for k, v in item.items():
+def item_seq(item: dict, target: str = "admrul") -> str | None:
+    """lawService.do 의 `ID` 파라미터에 넣을 값을 고른다.
+
+    target 마다 `ID` 의 의미가 다르다 (open.law.go.kr 공식 가이드):
+      admrul     : ID = 행정규칙**일련번호**  (행정규칙ID 는 별도 파라미터 LID)
+      law/eflaw  : ID = 법령**ID**            (마스터번호는 별도 파라미터 MST)
+
+    검색 응답에는 둘 다 들어 있어서, 아무거나 집으면 엉뚱한 문서를 부르거나
+    본문이 비어 온다. 실제로 행정규칙ID(36814)를 ID 로 넘겨 별표가 비어 있었다.
+    """
+    order = (
+        ("행정규칙일련번호", "일련번호")
+        if target == "admrul"
+        else ("법령ID", "ID", "일련번호")
+    )
+    for needle in order:
+        for k, v in item.items():
+            if needle in k and v not in (None, "", []):
+                return str(v)
+    for k, v in item.items():  # 알 수 없는 target 을 위한 최후 폴백
         if ("일련번호" in k or k.endswith("ID")) and v:
             return str(v)
     return None
@@ -276,7 +303,7 @@ def resolve_seq(client: LawClient, args) -> str:
             sys.exit(f"'{args.query}' 검색 결과가 없습니다. --target 을 확인하세요(law/admrul/ordin).")
 
         chosen, why = pick_best_match(items, args.query)
-        seq = item_seq(chosen)
+        seq = item_seq(chosen, args.target)
         if not getattr(args, "quiet", False):
             print(f"[선택] {seq}  {item_name(chosen)}  ({why})", file=sys.stderr)
             if why != "정확히 일치" and len(items) > 1:
@@ -286,7 +313,7 @@ def resolve_seq(client: LawClient, args) -> str:
                     file=sys.stderr,
                 )
                 for it in items[:5]:
-                    print(f"    {item_seq(it)}\t{item_name(it)}", file=sys.stderr)
+                    print(f"    {item_seq(it, args.target)}\t{item_name(it)}", file=sys.stderr)
         if seq is None:
             sys.exit("검색 결과에서 일련번호를 찾지 못했습니다.")
         return seq
@@ -295,20 +322,71 @@ def resolve_seq(client: LawClient, args) -> str:
     return args.seq
 
 
+def filter_by_owner(records: list[dict], law_name: str | None, quiet: bool = False) -> list[dict]:
+    """검색된 별표 중 '우리가 찾는 고시 소속' 만 남긴다.
+
+    admbyl 검색은 별표*명*으로 찾기 때문에(`section: admBylNm`) 이름이 비슷한
+    다른 고시의 별표가 딸려온다. 실제로 '식품등의 표시기준' 을 찾았는데
+    「식품 등 이력추적관리기준」의 별표가 나왔다.
+
+    소속이 하나도 안 맞으면 빈 목록을 돌려준다 — 엉뚱한 고시의 별표를
+    조용히 내려받게 두는 것보다 못 찾았다고 말하는 편이 안전하다.
+    """
+    if not law_name:
+        return records
+    target = re.sub(r"\s+", "", law_name)
+    kept = [r for r in records if r.get("owner") and re.sub(r"\s+", "", r["owner"]) == target]
+    if kept or not records:
+        return kept
+
+    if not quiet:
+        others = sorted({r["owner"] for r in records if r.get("owner")})
+        print(
+            f"  [주의] 검색된 별표는 '{law_name}' 소속이 아닙니다."
+            + ("\n  실제 소속 고시:" if others else ""),
+            file=sys.stderr,
+        )
+        for o in others[:5]:
+            print(f"    - {o}", file=sys.stderr)
+        print(
+            "  admbyl 검색은 별표 '이름' 으로 찾기 때문에 다른 고시 것이 섞입니다.\n"
+            "  소속 무관하게 전부 보려면 `--via admbyl --no-owner-filter` 를 쓰세요.",
+            file=sys.stderr,
+        )
+    return []
+
+
 def collect_attachments(client: LawClient, args) -> list[dict]:
     """--via 에 따라 별표 목록을 모은다. detail 이 비면 admbyl 로 폴백."""
+    quiet = getattr(args, "quiet", False)
+    keep_all = getattr(args, "no_owner_filter", False)
+
+    # admbyl 의 search=2 는 '해당법령검색' — 별표*명* 이 아니라 소속 고시명으로 찾는다.
+    byl_search = getattr(args, "byl_search", 2)
+
     if args.via == "admbyl":
         query = args.query or args.seq
-        return extract_attachments(client.search(query, "admbyl", display=100))
+        records = extract_attachments(
+            client.search(query, "admbyl", display=100, search=byl_search)
+        )
+        return records if keep_all else filter_by_owner(records, args.query, quiet)
 
     seq = resolve_seq(client, args)
     detail = client.service(seq, args.target)
     records = extract_attachments(detail)
-    if not records:
-        fallback = args.query or detail_title(detail) or str(seq)
-        print(f"[폴백] 본문에 별표 링크가 없어 admbyl 로 직접 조회: {fallback}", file=sys.stderr)
-        records = extract_attachments(client.search(fallback, "admbyl", display=100))
-    return records
+    if records:
+        return records
+
+    fallback = args.query or detail_title(detail) or str(seq)
+    if not quiet:
+        print(
+            f"[폴백] 본문에 별표 링크가 없어 admbyl(search={byl_search}) 로 직접 조회: {fallback}",
+            file=sys.stderr,
+        )
+    records = extract_attachments(
+        client.search(fallback, "admbyl", display=100, search=byl_search)
+    )
+    return records if keep_all else filter_by_owner(records, fallback, quiet)
 
 
 def apply_byl_filter(records: list[dict], spec: str | None) -> list[dict]:
@@ -420,7 +498,7 @@ def cmd_search(args):
         print(json.dumps(items, ensure_ascii=False, indent=2))
         return
     for it in items:
-        print(f"{item_seq(it) or '?'}\t{item_name(it)}")
+        print(f"{item_seq(it, args.target) or '?'}\t{item_name(it)}")
 
 
 def cmd_annexes(args):
@@ -664,6 +742,23 @@ def cmd_cache(args):
 # ---------------------------------------------------------------------------
 
 
+def add_byl_source_opts(p):
+    """별표 목록을 어디서·어떻게 가져올지에 대한 공통 옵션."""
+    p.add_argument("--via", choices=["detail", "admbyl"], default="detail")
+    p.add_argument(
+        "--byl-search",
+        type=int,
+        choices=[1, 2, 3],
+        default=2,
+        help="admbyl 검색범위: 1=별표서식명, 2=해당법령검색(기본), 3=별표본문",
+    )
+    p.add_argument(
+        "--no-owner-filter",
+        action="store_true",
+        help="다른 고시 소속 별표도 함께 보기(기본은 해당 고시 것만)",
+    )
+
+
 def add_common(p, *, need_target=True):
     p.add_argument("--oc", help="법제처 OPEN API 인증키(기본: $LAW_GO_KR_OC)")
     if need_target:
@@ -704,7 +799,7 @@ def main():
     p.add_argument("seq", nargs="?")
     p.add_argument("--query")
     p.add_argument("--byl", help="'별표 4', '4', '별지 1', '별표 4,별표 5'")
-    p.add_argument("--via", choices=["detail", "admbyl"], default="detail")
+    add_byl_source_opts(p)
     add_common(p)
     p.set_defaults(func=cmd_annexes)
 
@@ -717,7 +812,7 @@ def main():
     p.add_argument("seq", nargs="?")
     p.add_argument("--query", help="이름으로 검색해 첫 결과를 사용")
     p.add_argument("--byl", help="특정 별표만: '별표 4', '4', '별표 4,별표 5'")
-    p.add_argument("--via", choices=["detail", "admbyl"], default="detail")
+    add_byl_source_opts(p)
     p.add_argument("--outdir", default="./law_attachments")
     p.add_argument("--parse", action="store_true", help="다운로드 후 텍스트 파싱")
     p.add_argument("--grep", help="파싱 결과에서 키워드 포함 줄만 출력")

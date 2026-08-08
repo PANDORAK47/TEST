@@ -333,18 +333,31 @@ class LawClient:
 
     # ---------- 고수준 ----------
 
-    def search(self, query: str, target: str = "admrul", display: int = 20, page: int = 1) -> dict:
-        return self.get_json(
-            SEARCH_URL,
-            {
-                "OC": self.oc,
-                "target": target,
-                "type": "JSON",
-                "query": query,
-                "display": display,
-                "page": page,
-            },
-        )
+    def search(
+        self,
+        query: str,
+        target: str = "admrul",
+        display: int = 20,
+        page: int = 1,
+        search: int | None = None,
+    ) -> dict:
+        """목록 조회.
+
+        `search` 는 검색범위다. target 마다 의미가 다르다(공식 가이드):
+          admrul : 1=행정규칙명(기본), 2=본문검색
+          admbyl : 1=별표서식명(기본), 2=해당법령검색, 3=별표본문검색
+        """
+        params = {
+            "OC": self.oc,
+            "target": target,
+            "type": "JSON",
+            "query": query,
+            "display": display,
+            "page": page,
+        }
+        if search is not None:
+            params["search"] = search
+        return self.get_json(SEARCH_URL, params)
 
     def service(self, seq: str, target: str = "admrul") -> dict:
         return self.get_json(

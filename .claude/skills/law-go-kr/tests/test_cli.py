@@ -110,8 +110,8 @@ class FakeClient:
         self.search_calls = []
         self.service_calls = []
 
-    def search(self, query, target="admrul", display=20, page=1):
-        self.search_calls.append((query, target, display))
+    def search(self, query, target="admrul", display=20, page=1, search=None):
+        self.search_calls.append((query, target, display, search))
         return self._search
 
     def service(self, seq, target="admrul"):
@@ -120,7 +120,8 @@ class FakeClient:
 
 
 def ns(**kw):
-    base = dict(via="detail", query=None, seq=None, target="admrul", display=20, byl=None)
+    base = dict(via="detail", query=None, seq=None, target="admrul", display=20, byl=None,
+                byl_search=2, no_owner_filter=True, quiet=True)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -137,6 +138,33 @@ class TestSearchItems(unittest.TestCase):
 
     def test_empty_payload(self):
         self.assertEqual(search_items({}), [])
+
+
+class TestItemSeqTargetAware(unittest.TestCase):
+    """공식 가이드: admrul 은 ID=행정규칙일련번호, law 는 ID=법령ID.
+    검색 응답에 둘 다 있어서 아무거나 집으면 본문이 비어 온다."""
+
+    ADMRUL_ITEM = {
+        "행정규칙ID": "36814",              # ← LID 파라미터용. ID 에 넣으면 안 된다
+        "행정규칙명": "식품등의 표시기준",
+        "행정규칙일련번호": "2100000279602",  # ← ID 파라미터용
+    }
+    LAW_ITEM = {"법령ID": "001234", "법령명한글": "식품위생법", "법령일련번호": "9988776655"}
+
+    def test_admrul_uses_serial_number(self):
+        self.assertEqual(item_seq(self.ADMRUL_ITEM, "admrul"), "2100000279602")
+
+    def test_admrul_ignores_rule_id(self):
+        self.assertNotEqual(item_seq(self.ADMRUL_ITEM, "admrul"), "36814")
+
+    def test_law_uses_law_id(self):
+        self.assertEqual(item_seq(self.LAW_ITEM, "law"), "001234")
+
+    def test_default_target_is_admrul(self):
+        self.assertEqual(item_seq(self.ADMRUL_ITEM), "2100000279602")
+
+    def test_missing_fields_returns_none(self):
+        self.assertIsNone(item_seq({"행정규칙명": "이름만 있음"}, "admrul"))
 
 
 class TestZeroPaddedBylNumber(unittest.TestCase):
@@ -277,6 +305,8 @@ class TestCollectAttachments(unittest.TestCase):
         self.assertEqual(len(recs), 6)
         self.assertEqual(len(c.search_calls), 1)
         self.assertEqual(c.search_calls[0][1], "admbyl")
+        # search=2 = '해당법령검색' — 별표명이 아니라 소속 고시명으로 찾아야 한다
+        self.assertEqual(c.search_calls[0][3], 2)
 
     def test_via_admbyl_skips_detail(self):
         c = FakeClient(search_payload=ADMBYL_SEARCH)
