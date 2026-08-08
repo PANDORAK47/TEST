@@ -309,6 +309,134 @@ def _iter_dicts(node):
             yield from _iter_dicts(v)
 
 
+def _clean_num(raw: str | None) -> str | None:
+    """호/목 번호에서 뒤의 마침표를 뗀다 ('1.' → '1', '5의2.' → '5의2').
+
+    렌더러가 마침표를 따로 붙이므로 원본 그대로 두면 '1..' 처럼 겹친다.
+    """
+    return raw.rstrip(".") if raw else raw
+
+
+def _strip_own_marker(content: str, marker: str | None) -> str:
+    """내용 맨 앞에 이미 박혀 있는 번호를 제거한다.
+
+    법령 API 구조화 응답은 항내용/호내용/목내용에 해당 번호를 이미 포함해서
+    준다 ("① 누구든지...", '1. "식품"이란...'). 렌더러(articles_to_text 등)가
+    번호를 따로 붙이므로 그대로 두면 "① ① 누구든지..." 처럼 중복된다.
+    """
+    if not marker:
+        return content
+    stripped = content.lstrip()
+    return stripped[len(marker):].lstrip() if stripped.startswith(marker) else content
+
+
+def _strip_article_head(content: str, num, branch, title) -> str:
+    """조문내용 맨 앞의 '제N조(제목)' 머리말을 뗀다.
+
+    정규식 파싱 경로(parse_articles)는 조/항 번호를 캡처하고 남은 본문만
+    저장하는데, 구조화 JSON 경로는 조문내용에 머리말이 그대로 포함돼 온다
+    ("제1조(목적) 이 법은 ..."). 두 경로의 출력을 맞추기 위해 동일하게 뗀다.
+    """
+    if not num:
+        return content
+    head = f"제{num}조" + (f"의{branch}" if branch else "")
+    stripped = content.lstrip()
+    if title and stripped.startswith(f"{head}({title})"):
+        return stripped[len(f"{head}({title})") :].lstrip()
+    if stripped.startswith(head):
+        rest = stripped[len(head) :].lstrip()
+        # '제2조 정의' 처럼 괄호 없이 제목이 그대로 이어지는 경우까지는
+        # 건드리지 않는다 — 괄호쌍이 없으면 본문과 구분할 수 없다.
+        if rest.startswith("("):
+            close = rest.find(")")
+            if close != -1:
+                return rest[close + 1 :].lstrip()
+    return content
+
+
+def _parse_ho_list(ho_list) -> list[dict]:
+    """'호' 리스트를 표준 {"번호","내용","목"} 형태로 변환한다."""
+    hos = []
+    for h in ho_list or []:
+        if not isinstance(h, dict):
+            continue
+        hnum_raw = next(
+            (strip_markup(str(x)) for kk, x in h.items() if "호번호" in kk and x), None
+        )
+        hbody_raw = next(
+            (strip_markup(str(x)) for kk, x in h.items() if "호내용" in kk and isinstance(x, str)),
+            "",
+        )
+        moks = []
+        for kk, v in h.items():
+            if "목" in kk and isinstance(v, list):
+                for m in v:
+                    if not isinstance(m, dict):
+                        continue
+                    mnum_raw = next(
+                        (strip_markup(str(x)) for kkk, x in m.items() if "목번호" in kkk and x),
+                        None,
+                    )
+                    mbody_raw = next(
+                        (
+                            strip_markup(str(x))
+                            for kkk, x in m.items()
+                            if "목내용" in kkk and isinstance(x, str)
+                        ),
+                        "",
+                    )
+                    moks.append(
+                        {
+                            "번호": _clean_num(mnum_raw),
+                            "내용": _strip_own_marker(mbody_raw, mnum_raw).strip(),
+                        }
+                    )
+        hos.append(
+            {
+                "번호": _clean_num(hnum_raw),
+                "내용": _strip_own_marker(hbody_raw, hnum_raw).strip(),
+                "목": moks,
+            }
+        )
+    return hos
+
+
+def _parse_para_list(para_val) -> list[dict]:
+    """'항' 값(리스트 또는 단일 dict)을 표준 paragraph 리스트로 변환한다.
+
+    항이 여러 개면 리스트로 오지만, 항 구분 없이 바로 호부터 시작하는
+    조문(예: 정의 조항)은 '항' 자체가 {"호": [...]} 형태의 단일 dict로 온다.
+    이 경우를 list 로만 처리하면 안의 호 항목이 통째로 사라진다
+    (실제로 겪은 버그 — 「식품위생법」 제2조 정의의 호 9개가 전부 유실됐었다).
+    """
+    if isinstance(para_val, dict):
+        ho_list = para_val.get("호")
+        if isinstance(ho_list, list):
+            return [{"번호": None, "내용": "", "호": _parse_ho_list(ho_list)}]
+        para_val = [para_val]
+
+    paras = []
+    for p in para_val or []:
+        if not isinstance(p, dict):
+            continue
+        pnum_raw = next(
+            (str(x) for kk, x in p.items() if "번호" in kk and isinstance(x, str) and x), None
+        )
+        pbody_raw = next(
+            (strip_markup(str(x)) for kk, x in p.items() if "내용" in kk and isinstance(x, str)),
+            "",
+        )
+        ho_list = p.get("호") if isinstance(p.get("호"), list) else None
+        paras.append(
+            {
+                "번호": pnum_raw,
+                "내용": _strip_own_marker(pbody_raw, pnum_raw).strip(),
+                "호": _parse_ho_list(ho_list) if ho_list else [],
+            }
+        )
+    return paras
+
+
 def extract_articles(detail: dict) -> list[dict]:
     """상세 JSON에서 조문 트리를 뽑는다.
 
@@ -324,31 +452,34 @@ def extract_articles(detail: dict) -> list[dict]:
     if units:
         out = []
         for u in units:
+            # '전문' 등 조문이 아닌 장/절 표제 항목은 제외한다. 실제로 겪은
+            # 버그: "제1장 총칙" 이 조문번호="1" 을 공유해 가짜 제1조로 잡혔다.
+            status = next((v for kk, v in u.items() if "조문여부" in kk), None)
+            if status not in (None, "", "조문"):
+                continue
+
             def g(*needles, default=""):
                 for k, v in u.items():
                     if any(n in k for n in needles) and isinstance(v, str):
                         return strip_markup(v).strip()
                 return default
 
-            paras = []
+            num = g("조문번호", default=None) or None
+            branch = g("조문가지번호", default=None) or None
+            title = g("조문제목", default=None) or None
+
+            paras: list[dict] = []
             for k, v in u.items():
-                if k.startswith("항") and isinstance(v, list):
-                    for p in v:
-                        if not isinstance(p, dict):
-                            continue
-                        pnum = next(
-                            (strip_markup(str(x)) for kk, x in p.items() if "번호" in kk), None
-                        )
-                        pbody = next(
-                            (strip_markup(str(x)) for kk, x in p.items() if "내용" in kk), ""
-                        )
-                        paras.append({"번호": pnum, "내용": pbody.strip(), "호": []})
+                if k.startswith("항"):
+                    paras = _parse_para_list(v)
+                    break
+
             out.append(
                 {
-                    "번호": g("조문번호", default=None) or None,
-                    "가지": g("조문가지번호", default=None) or None,
-                    "제목": g("조문제목", default=None) or None,
-                    "내용": g("조문내용"),
+                    "번호": num,
+                    "가지": branch,
+                    "제목": title,
+                    "내용": _strip_article_head(g("조문내용"), num, branch, title),
                     "항": paras,
                 }
             )
@@ -502,7 +633,7 @@ def articles_to_kb_entries(articles: list[dict], category: str, source: str) -> 
                 parts.append(f"{p.get('번호') or ''} {p['내용']}".strip())
             for h in p.get("호", []):
                 if h.get("내용"):
-                    parts.append(f"  {h.get('번호')}. {h['내용']}")
+                    parts.append(f"{h.get('번호')}. {h['내용']}")
         definition = " ".join(parts).strip()
         if not definition:
             continue

@@ -7,24 +7,26 @@
 
 | 버전 | 파일 | 체크섬 |
 |---|---|---|
-| **1.0.0** | `law-go-kr-1.0.0.zip` | `law-go-kr-1.0.0.zip.sha256` |
+| **1.0.1** | `law-go-kr-1.0.1.zip` | `law-go-kr-1.0.1.zip.sha256` |
 
-버전 번호는 `law-go-kr/VERSION` 파일에도 들어 있다.
+버전 번호는 `law-go-kr/VERSION` 파일에도 들어 있다. 이전 버전 zip은 지우지
+않고 그대로 둔다 — 배포된 버전의 내용은 이후에 덮어쓰지 않는다(불변).
+버그를 고치면 새 버전 번호로 다시 패키징한다.
 
 ## 설치 (다른 PC)
 
 ### 1) 다운로드 후 무결성 확인 (선택)
 
 ```bash
-shasum -a 256 -c law-go-kr-1.0.0.zip.sha256
-# 또는 Linux: sha256sum -c law-go-kr-1.0.0.zip.sha256
+shasum -a 256 -c law-go-kr-1.0.1.zip.sha256
+# 또는 Linux: sha256sum -c law-go-kr-1.0.1.zip.sha256
 ```
 
 ### 2) 압축 해제 → Claude Code 스킬 폴더에 배치
 
 ```bash
 mkdir -p ~/.claude/skills
-unzip law-go-kr-1.0.0.zip -d ~/.claude/skills/
+unzip law-go-kr-1.0.1.zip -d ~/.claude/skills/
 # 결과: ~/.claude/skills/law-go-kr/
 ```
 
@@ -61,7 +63,7 @@ python3 ~/.claude/skills/law-go-kr/scripts/law_fetch.py doctor
 ## 패키지 구조
 
 ```
-law-go-kr-1.0.0.zip
+law-go-kr-1.0.1.zip
 └── law-go-kr/
     ├── SKILL.md          사용법·API 스펙·한계 전체 문서
     ├── VERSION           배포 버전 번호
@@ -70,13 +72,14 @@ law-go-kr-1.0.0.zip
     │   ├── lawapi.py     HTTP 계층(재시도·캐시·오류 구분)
     │   ├── parsers.py    파싱 계층(순수 함수)
     │   └── run_local.sh  원클릭 실행 스크립트
-    └── tests/            네트워크 없이 도는 테스트 114개
+    └── tests/            네트워크 없이 도는 테스트 121개
 ```
 
 ## 버전 이력
 
 | 버전 | 날짜 | 비고 |
 |---|---|---|
+| 1.0.1 | 2026-08-08 | 실제 API 전 기능 테스트로 조문 구조화 버그 3건 수정: (1) "제1장 총칙" 같은 장 표제가 가짜 조문으로 잡히던 것, (2) 항/호 내용에 번호가 중복 출력되던 것("① ①", "1. 1."), (3) 항이 단일 dict로 올 때(정의 조항 등) 호 항목이 통째로 유실되던 것. 「식품위생법」 제2조 실제 응답으로 검증 |
 | 1.0.0 | 2026-08-08 | 첫 배포. 3계층 재구축, 별표 번호 지정(`--byl`), 조문 구조화, `doctor` 진단, 실제 API 전 구간 검증 완료 |
 
 ## 새 버전 만들기 (관리자용)

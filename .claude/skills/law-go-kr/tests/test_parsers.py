@@ -304,6 +304,115 @@ class TestCacheKey(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+# 실제 lawService.do(target=law, ID=001805 「식품위생법」) 응답에서 그대로
+# 옮긴 픽스처(첫 4개 조문단위, OC=test 로 조회). 세 가지 함정을 담고 있다:
+#   1) 조문여부="전문" 인 장(章) 표제가 진짜 조문과 같은 조문번호를 공유한다
+#   2) 항내용/호내용에 번호가 이미 박혀 있다("① 누구든지...", '1. "식품"...')
+#   3) 항이 하나뿐이면(정의 조항처럼) '항' 자체가 {"호":[...]} 단일 dict로 온다
+REAL_LAW_DETAIL = {
+    "법령": {
+        "조문": {
+            "조문단위": [
+                {
+                    "조문번호": "1",
+                    "조문내용": "                        제1장 총칙",
+                    "조문여부": "전문",
+                },
+                {
+                    "조문번호": "1",
+                    "조문내용": (
+                        "제1조(목적) 이 법은 식품으로 인하여 생기는 위생상의 위해(危害)를 "
+                        "방지하고 식품영양의 질적 향상을 도모하며 식품에 관한 올바른 정보를 "
+                        "제공함으로써 국민 건강의 보호ㆍ증진에 이바지함을 목적으로 한다."
+                    ),
+                    "조문제목": "목적",
+                    "조문여부": "조문",
+                },
+                {
+                    "조문번호": "2",
+                    "항": {
+                        "호": [
+                            {"호번호": "1.", "호내용": '1. "식품"이란 모든 음식물을 말한다.'},
+                            {
+                                "호번호": "5의2.",
+                                "호내용": '5의2. "공유주방"이란 여러 영업자가 함께 사용하는 장소를 말한다.',
+                            },
+                        ]
+                    },
+                    "조문내용": "제2조(정의) 이 법에서 사용하는 용어의 뜻은 다음과 같다.",
+                    "조문제목": "정의",
+                    "조문여부": "조문",
+                },
+                {
+                    "조문번호": "3",
+                    "항": [
+                        {
+                            "항번호": "①",
+                            "항내용": "① 누구든지 판매를 목적으로 식품을 위생적으로 취급하여야 한다.",
+                        },
+                        {
+                            "항번호": "②",
+                            "항내용": "② 영업에 사용하는 기구는 깨끗하고 위생적으로 다루어야 한다.",
+                        },
+                    ],
+                    "조문내용": "제3조(식품 등의 취급)",
+                    "조문제목": "식품 등의 취급",
+                    "조문여부": "조문",
+                },
+            ]
+        }
+    }
+}
+
+
+class TestRealLawDetailResponse(unittest.TestCase):
+    """실제 law 상세 응답으로 확인된 구조화 파싱 함정에 대한 회귀 테스트."""
+
+    def setUp(self):
+        self.arts = extract_articles(REAL_LAW_DETAIL)
+
+    def test_chapter_heading_excluded(self):
+        # "전문"(제1장 총칙)이 조문번호를 공유해도 별도 가짜 조문으로 잡히면 안 된다
+        self.assertEqual(len(self.arts), 3)
+        self.assertEqual([a["번호"] for a in self.arts], ["1", "2", "3"])
+
+    def test_article_content_head_stripped(self):
+        # 조문내용에 "제1조(목적)" 머리말이 중복으로 남아있으면 안 된다
+        art1 = self.arts[0]
+        self.assertFalse(art1["내용"].startswith("제1조"))
+        self.assertTrue(art1["내용"].startswith("이 법은"))
+
+    def test_dict_shaped_para_recovers_ho_items(self):
+        # 항이 단일 dict({"호":[...]})로 와도 호 항목이 유실되면 안 된다
+        art2 = self.arts[1]
+        self.assertEqual(len(art2["항"]), 1)
+        hos = art2["항"][0]["호"]
+        self.assertEqual(len(hos), 2)
+        self.assertEqual(hos[0]["번호"], "1")  # 마침표 없이 저장
+        self.assertEqual(hos[1]["번호"], "5의2")
+
+    def test_ho_content_marker_not_duplicated(self):
+        hos = self.arts[1]["항"][0]["호"]
+        self.assertFalse(hos[0]["내용"].startswith("1."))
+        self.assertTrue(hos[0]["내용"].startswith('"식품"'))
+
+    def test_list_shaped_para_still_works(self):
+        art3 = self.arts[2]
+        self.assertEqual([p["번호"] for p in art3["항"]], ["①", "②"])
+
+    def test_para_content_marker_not_duplicated(self):
+        # "① ① 누구든지..." 처럼 겹치면 안 된다
+        para = self.arts[2]["항"][0]
+        self.assertFalse(para["내용"].startswith("①"))
+        self.assertTrue(para["내용"].startswith("누구든지"))
+
+    def test_rendered_text_has_no_double_markers(self):
+        out = articles_to_text(self.arts)
+        self.assertNotIn("① ①", out)
+        self.assertNotIn("1. 1.", out)
+        self.assertNotIn("제1장", out)
+
+
 class TestApiErrorEnvelope(unittest.TestCase):
     """법제처는 인증 실패도 HTTP 200 + JSON 으로 준다. 이걸 '결과 없음'으로
     보여주면 고칠 수 있는 문제가 묻힌다 — 실제 호출에서 발견된 버그의 회귀 테스트."""
