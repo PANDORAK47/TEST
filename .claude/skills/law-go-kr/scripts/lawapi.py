@@ -80,16 +80,52 @@ def _blocked_message(url: str, exc: Exception) -> str:
     )
 
 
+def check_api_error(data, url: str = "") -> None:
+    """법제처가 HTTP 200 으로 돌려주는 오류 봉투를 예외로 승격한다.
+
+    정상 응답은 target 이름을 최상위 키로 쓴다(`{"AdmRulSearch": {...}}`,
+    `{"행정규칙": {...}}`). 반면 오류는 다음처럼 온다:
+
+        {"result": "사용자 정보 검증에 실패하였습니다.",
+         "msg": "OPEN API 호출 시 사용자 검증을 위하여 ... 등록해 주세요."}
+
+    이걸 그냥 통과시키면 상위에서 '검색 결과 없음' 으로 보여, 고칠 수 있는
+    인증 문제가 조용히 묻힌다.
+    """
+    if not isinstance(data, dict):
+        return
+    result = data.get("result")
+    if not isinstance(result, str) or not result.strip():
+        return
+
+    msg = str(data.get("msg", "")).strip()
+    hint = ""
+    if any(w in result + msg for w in ("검증", "IP", "등록", "인증", "권한")):
+        hint = (
+            "\n  참고: 법제처는 'OC 키가 틀린 경우'와 'IP 미등록'에 똑같은 메시지를\n"
+            "        돌려준다. 메시지만으로는 둘을 구분할 수 없으니 아래를 모두 확인할 것.\n"
+            "  해결:\n"
+            "    1) open.law.go.kr 로그인 → OPEN API 신청 정보에서\n"
+            "       '서버 IP / 도메인' 에 호출하는 장비의 아웃바운드 IP 가 등록됐는지\n"
+            "    2) OC 값이 신청 시 아이디와 정확히 같은지\n"
+            "    3) 원격/클라우드 실행 환경은 아웃바운드 IP 가 유동이라 등록이 잘 안 맞는다.\n"
+            "       고정 IP 서버나 로컬 PC 에서 실행하는 편이 확실하다."
+        )
+    where = f"\n  요청: {url}" if url else ""
+    raise ApiResponseError(f"법제처 API 오류: {result}" + (f"\n  {msg}" if msg else "") + hint + where)
+
+
 class Response:
     """캐시 히트와 실제 응답을 같은 모양으로 다루기 위한 최소 래퍼."""
 
-    __slots__ = ("content", "headers", "from_cache", "url")
+    __slots__ = ("content", "headers", "from_cache", "url", "cache_key")
 
-    def __init__(self, content: bytes, headers: dict, from_cache: bool, url: str):
+    def __init__(self, content: bytes, headers: dict, from_cache: bool, url: str, cache_key: str = ""):
         self.content = content
         self.headers = headers
         self.from_cache = from_cache
         self.url = url
+        self.cache_key = cache_key
 
     def text(self, encoding: str = "utf-8") -> str:
         return self.content.decode(encoding, errors="replace")
@@ -129,6 +165,14 @@ class Cache:
             except (json.JSONDecodeError, OSError):
                 headers = {}
         return Response(body.read_bytes(), headers, from_cache=True, url="")
+
+    def evict(self, key: str) -> None:
+        """오류 응답이 캐시에 남지 않도록 지운다."""
+        for p in (self.root / key, self.root / f"{key}.hdr"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     def put(self, key: str, content: bytes, headers: dict) -> None:
         if not self.enabled:
@@ -207,6 +251,7 @@ class LawClient:
         hit = self.cache.get(key)
         if hit is not None:
             hit.url = url
+            hit.cache_key = key
             self._log(f"  [캐시] {url}")
             return hit
 
@@ -233,7 +278,7 @@ class LawClient:
                         "  인증키(OC)가 유효하지 않거나 해당 API 사용 권한이 없을 수 있습니다."
                     )
                 else:
-                    resp = Response(r.content, dict(r.headers), False, url)
+                    resp = Response(r.content, dict(r.headers), False, url, key)
                     self.cache.put(key, resp.content, resp.headers)
                     return resp
 
@@ -250,12 +295,19 @@ class LawClient:
         )
 
     def get_json(self, url: str, params: dict) -> dict:
-        """JSON 응답을 파싱한다. HTML 이 오면 인증 문제로 간주하고 안내한다."""
+        """JSON 응답을 파싱한다.
+
+        법제처는 인증 실패도 HTTP 200 + JSON 오류 봉투로 돌려주므로, 파싱에
+        성공해도 내용을 한 번 더 검사한다. 오류면 캐시에서 지우고 예외를 던진다.
+        """
         resp = self.request(url, params)
         text = resp.text().lstrip()
+
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except json.JSONDecodeError:
+            if resp.cache_key:
+                self.cache.evict(resp.cache_key)
             head = text[:200].replace("\n", " ")
             if text.startswith(("<!DOCTYPE", "<html", "<HTML")):
                 raise ApiResponseError(
@@ -270,6 +322,14 @@ class LawClient:
             raise ApiResponseError(
                 f"JSON 파싱 실패 — {resp.url}\n  응답 앞부분: {head}"
             ) from None
+
+        try:
+            check_api_error(data, resp.url)
+        except ApiResponseError:
+            if resp.cache_key:  # 오류 응답이 24시간 캐시에 눌러앉지 않도록
+                self.cache.evict(resp.cache_key)
+            raise
+        return data
 
     # ---------- 고수준 ----------
 

@@ -304,5 +304,66 @@ class TestCacheKey(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class TestApiErrorEnvelope(unittest.TestCase):
+    """법제처는 인증 실패도 HTTP 200 + JSON 으로 준다. 이걸 '결과 없음'으로
+    보여주면 고칠 수 있는 문제가 묻힌다 — 실제 호출에서 발견된 버그의 회귀 테스트."""
+
+    def setUp(self):
+        from lawapi import ApiResponseError, check_api_error
+
+        self.check = check_api_error
+        self.Err = ApiResponseError
+
+    def test_auth_failure_raises_with_guidance(self):
+        payload = {
+            "result": "사용자 정보 검증에 실패하였습니다.",
+            "msg": "OPEN API 호출 시 사용자 검증을 위하여 정확한 서버장비의 IP주소 및 도메인주소를 등록해 주세요.",
+        }
+        with self.assertRaises(self.Err) as cm:
+            self.check(payload, "https://www.law.go.kr/DRF/lawSearch.do")
+        msg = str(cm.exception)
+        self.assertIn("사용자 정보 검증에 실패", msg)
+        self.assertIn("open.law.go.kr", msg)  # 해결 방법을 알려줘야 한다
+        self.assertIn("lawSearch.do", msg)
+
+    def test_legit_search_response_passes(self):
+        self.check({"AdmRulSearch": {"admrul": [{"행정규칙명": "식품등의 표시기준"}]}})
+
+    def test_legit_service_response_passes(self):
+        self.check({"행정규칙": {"행정규칙명": "식품등의 표시기준", "조문내용": "제1조..."}})
+
+    def test_non_dict_passes(self):
+        self.check([])
+        self.check("문자열")
+        self.check(None)
+
+    def test_empty_result_field_passes(self):
+        self.check({"result": "", "other": 1})
+
+
+class TestCacheEvict(unittest.TestCase):
+    def test_evict_removes_body_and_headers(self):
+        import tempfile
+        from pathlib import Path as P
+
+        from lawapi import Cache
+
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(P(td))
+            c.put("k1", b"data", {"Content-Type": "application/json"})
+            self.assertIsNotNone(c.get("k1"))
+            c.evict("k1")
+            self.assertIsNone(c.get("k1"))
+
+    def test_evict_missing_key_is_safe(self):
+        import tempfile
+        from pathlib import Path as P
+
+        from lawapi import Cache
+
+        with tempfile.TemporaryDirectory() as td:
+            Cache(P(td)).evict("nonexistent")  # 예외가 나면 안 된다
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

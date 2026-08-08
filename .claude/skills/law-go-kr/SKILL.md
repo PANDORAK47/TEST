@@ -45,7 +45,21 @@ law-go-kr/
    Claude Code on the web 의 기본 egress 정책은 이 호스트를 차단하므로,
    Environments → Custom network 에 `www.law.go.kr`, `open.law.go.kr` 을 허용하거나
    접근 가능한 로컬/서버에서 실행한다. 차단 시 스크립트가 원인과 해결법을 안내한다.
-3. **의존성**: `requests` + korean-doc-parser 스킬의 파싱 스택
+3. **호출 IP 등록**: 네트워크가 열려도 법제처는 **OC 신청 시 등록한 서버 IP/도메인에서
+   오는 호출만** 받는다. 미등록 IP 에서 호출하면 HTTP 200 과 함께 아래를 돌려준다.
+
+   ```json
+   {"result": "사용자 정보 검증에 실패하였습니다.",
+    "msg": "OPEN API 호출 시 사용자 검증을 위하여 정확한 서버장비의 IP주소 및 도메인주소를 등록해 주세요."}
+   ```
+
+   ⚠️ **이 메시지는 'OC 키가 틀린 경우'에도 똑같이 나온다** — 실제로 존재하지 않는 키로
+   호출해도 응답이 완전히 동일하다. 따라서 메시지만으로 원인을 구분할 수 없으니
+   키와 IP 등록을 모두 확인해야 한다.
+
+   클라우드/원격 실행 환경은 아웃바운드 IP 가 유동이라 등록을 맞추기 어렵다.
+   **고정 IP 서버나 로컬 PC 에서 실행하는 것을 권한다.**
+4. **의존성**: `requests` + korean-doc-parser 스킬의 파싱 스택
    (`hwp-hwpx-parser`, `pymupdf`, `python-docx`, `mammoth`, `paddleocr`, `pytesseract`).
 
 ## 사용법
