@@ -235,15 +235,49 @@ def make_client(args) -> LawClient:
     )
 
 
+def pick_best_match(items: list[dict], query: str) -> tuple[dict, str]:
+    """검색 결과 중 질의에 가장 맞는 항목을 고른다.
+
+    법제처 검색은 부분일치라 '식품등의 표시기준' 으로 찾아도
+    '식품등의 부당한 표시 또는 광고의 내용 기준' 이 먼저 올 수 있다.
+    무조건 items[0] 을 쓰면 엉뚱한 고시를 조용히 집어온다.
+
+    반환: (선택된 항목, 선택 근거)
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", "", s or "")
+
+    q = norm(query)
+    for label, pred in (
+        ("정확히 일치", lambda n: n == q),
+        ("접두 일치", lambda n: n.startswith(q)),
+        ("부분 일치", lambda n: q in n),
+    ):
+        for it in items:
+            if pred(norm(item_name(it))):
+                return it, label
+    return items[0], "일치 없음 — 첫 결과"
+
+
 def resolve_seq(client: LawClient, args) -> str:
-    """--query 가 있으면 검색해서 첫 결과의 일련번호를 쓴다."""
+    """--query 가 있으면 검색해 가장 잘 맞는 결과의 일련번호를 쓴다."""
     if getattr(args, "query", None):
         items = search_items(client.search(args.query, args.target, args.display))
         if not items:
             sys.exit(f"'{args.query}' 검색 결과가 없습니다. --target 을 확인하세요(law/admrul/ordin).")
-        seq = item_seq(items[0])
+
+        chosen, why = pick_best_match(items, args.query)
+        seq = item_seq(chosen)
         if not getattr(args, "quiet", False):
-            print(f"[선택] {seq}  {item_name(items[0])}", file=sys.stderr)
+            print(f"[선택] {seq}  {item_name(chosen)}  ({why})", file=sys.stderr)
+            if why != "정확히 일치" and len(items) > 1:
+                print(
+                    f"  이름이 정확히 같은 결과가 없어 {len(items)}건 중에서 골랐습니다.\n"
+                    "  의도한 고시가 아니면 `search` 로 확인 후 일련번호를 직접 지정하세요:",
+                    file=sys.stderr,
+                )
+                for it in items[:5]:
+                    print(f"    {item_seq(it)}\t{item_name(it)}", file=sys.stderr)
         if seq is None:
             sys.exit("검색 결과에서 일련번호를 찾지 못했습니다.")
         return seq

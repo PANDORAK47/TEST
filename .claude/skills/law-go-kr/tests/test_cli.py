@@ -304,6 +304,53 @@ class TestDownloadNaming(unittest.TestCase):
             self.assertEqual(p.suffix, ".pdf")
 
 
+class TestPickBestMatch(unittest.TestCase):
+    """법제처 검색은 부분일치라 원하는 고시가 첫 줄에 안 온다.
+    실제 실행에서 '식품등의 표시기준' 검색이 '식품등의 부당한 표시 또는 광고의
+    내용 기준' 을 집어온 상황의 회귀 테스트."""
+
+    REAL = [
+        {"행정규칙명": "식품등의 부당한 표시 또는 광고의 내용 기준", "행정규칙일련번호": "69549"},
+        {"행정규칙명": "식품등의 표시기준", "행정규칙일련번호": "36814"},
+        {"행정규칙명": "식품등의 표시 또는 광고 심의 및 이의신청 기준", "행정규칙일련번호": "66910"},
+        {"행정규칙명": "유전자변형식품등의 표시기준", "행정규칙일련번호": "44603"},
+    ]
+
+    def test_exact_name_wins_over_first_result(self):
+        from law_fetch import pick_best_match
+
+        chosen, why = pick_best_match(self.REAL, "식품등의 표시기준")
+        self.assertEqual(item_seq(chosen), "36814")
+        self.assertEqual(why, "정확히 일치")
+
+    def test_whitespace_insensitive(self):
+        from law_fetch import pick_best_match
+
+        chosen, _ = pick_best_match(self.REAL, "식품등의  표시기준 ")
+        self.assertEqual(item_seq(chosen), "36814")
+
+    def test_prefix_match_when_no_exact(self):
+        from law_fetch import pick_best_match
+
+        chosen, why = pick_best_match(self.REAL, "식품등의 부당한")
+        self.assertEqual(item_seq(chosen), "69549")
+        self.assertEqual(why, "접두 일치")
+
+    def test_substring_match(self):
+        from law_fetch import pick_best_match
+
+        chosen, why = pick_best_match(self.REAL, "유전자변형")
+        self.assertEqual(item_seq(chosen), "44603")
+        self.assertEqual(why, "접두 일치")
+
+    def test_falls_back_to_first_with_reason(self):
+        from law_fetch import pick_best_match
+
+        chosen, why = pick_best_match(self.REAL, "존재하지않는이름")
+        self.assertEqual(item_seq(chosen), "69549")
+        self.assertIn("일치 없음", why)
+
+
 class TestProbeModule(unittest.TestCase):
     """'미설치'와 '의존성 누락'을 구분해야 한다 — 이미 설치한 사람에게
     '설치하세요'라고 하면 헛돌게 된다(실제로 mammoth 에서 겪은 상황)."""
