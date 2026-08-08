@@ -194,15 +194,25 @@ def byl_ref_from_item(item: dict) -> BylRef | None:
 # 2. 조문 구조화 (조 / 항 / 호 / 목)
 # ---------------------------------------------------------------------------
 
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+# ①~⑳(1-20) 뿐 아니라 ㉑~㉟(21-35, U+3251~325F), ㊱~㊿(36-50, U+32B1~32BF)
+# 까지 커버한다. 20개까지만 인식하면 21번째 이후 항이 전부 조문 본문에
+#뭉개진다(실제로 21개짜리 항목으로 구성된 조문에서 재현된 문제).
+CIRCLED = (
+    "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+    + "".join(chr(c) for c in range(0x3251, 0x3260))  # ㉑-㉟
+    + "".join(chr(c) for c in range(0x32B1, 0x32C0))  # ㊱-㊿
+)
 _CIRCLED_VALUE = {ch: i + 1 for i, ch in enumerate(CIRCLED)}
 _MOK_LETTERS = "가나다라마바사아자차카타파하"
 
 _ART_RE = re.compile(r"^\s*제\s*(\d+)\s*조\s*(?:의\s*(\d+))?\s*(?:\(([^)]*)\))?\s*(.*)$")
 _PARA_CIRCLED_RE = re.compile(rf"^\s*([{CIRCLED}])\s*(.*)$")
 _PARA_PAREN_RE = re.compile(r"^\s*\((\d{1,2})\)\s*(.*)$")
-_HO_RE = re.compile(r"^\s*(\d{1,2})\s*\.\s*(.*)$")
+# "1의2." 처럼 가지번호가 붙은 호도 인식한다 — 마침표 직전 숫자만 보던
+# 예전 패턴은 "1의2." 를 통째로 못 알아보고 앞 호의 내용에 붙여버렸다.
+_HO_RE = re.compile(r"^\s*(\d{1,2}(?:의\d{1,2})?)\s*\.\s*(.*)$")
 _MOK_RE = re.compile(rf"^\s*([{_MOK_LETTERS}])\s*\.\s*(.*)$")
+_CIRCLED_INLINE_RE = re.compile(rf"(?<!^)(?=[{CIRCLED}])")
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
@@ -217,6 +227,22 @@ def strip_markup(text: str) -> str:
     for ent, ch in (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"), ("&quot;", '"'), ("&nbsp;", " ")):
         text = text.replace(ent, ch)
     return text
+
+
+def break_before_circled(text: str) -> str:
+    """원문자(①②③...) 앞에 줄바꿈이 없으면 넣는다.
+
+    일부 응답(예: 자치법규 target=ordin)은 조문 하나의 전체 텍스트가
+    줄바꿈 없이 한 줄로 온다 — "...할 수 있다.② 제1항에 따른..." 처럼
+    항이 이어 붙어 있어서, 줄 단위로 동작하는 parse_articles 가 항을
+    하나도 못 알아본다(실제로 5개 항이 있는 조문이 0개 항으로 나온 사례).
+
+    원문자는 한국 법령 표기에서 거의 예외 없이 항의 시작에만 쓰이므로
+    ("가.", "1." 과 달리 날짜·목록 등 다른 문맥과 헷갈릴 여지가 없다),
+    이 문자 앞에서 줄을 나누는 것은 안전하다. 이미 줄 앞에 있는 경우는
+    빈 줄만 하나 늘어나고 parse_articles 가 빈 줄을 건너뛰므로 무해하다.
+    """
+    return _CIRCLED_INLINE_RE.sub("\n", text)
 
 
 def parse_articles(text: str) -> list[dict]:
@@ -309,6 +335,134 @@ def _iter_dicts(node):
             yield from _iter_dicts(v)
 
 
+def _clean_num(raw: str | None) -> str | None:
+    """호/목 번호에서 뒤의 마침표를 뗀다 ('1.' → '1', '5의2.' → '5의2').
+
+    렌더러가 마침표를 따로 붙이므로 원본 그대로 두면 '1..' 처럼 겹친다.
+    """
+    return raw.rstrip(".") if raw else raw
+
+
+def _strip_own_marker(content: str, marker: str | None) -> str:
+    """내용 맨 앞에 이미 박혀 있는 번호를 제거한다.
+
+    법령 API 구조화 응답은 항내용/호내용/목내용에 해당 번호를 이미 포함해서
+    준다 ("① 누구든지...", '1. "식품"이란...'). 렌더러(articles_to_text 등)가
+    번호를 따로 붙이므로 그대로 두면 "① ① 누구든지..." 처럼 중복된다.
+    """
+    if not marker:
+        return content
+    stripped = content.lstrip()
+    return stripped[len(marker):].lstrip() if stripped.startswith(marker) else content
+
+
+def _strip_article_head(content: str, num, branch, title) -> str:
+    """조문내용 맨 앞의 '제N조(제목)' 머리말을 뗀다.
+
+    정규식 파싱 경로(parse_articles)는 조/항 번호를 캡처하고 남은 본문만
+    저장하는데, 구조화 JSON 경로는 조문내용에 머리말이 그대로 포함돼 온다
+    ("제1조(목적) 이 법은 ..."). 두 경로의 출력을 맞추기 위해 동일하게 뗀다.
+    """
+    if not num:
+        return content
+    head = f"제{num}조" + (f"의{branch}" if branch else "")
+    stripped = content.lstrip()
+    if title and stripped.startswith(f"{head}({title})"):
+        return stripped[len(f"{head}({title})") :].lstrip()
+    if stripped.startswith(head):
+        rest = stripped[len(head) :].lstrip()
+        # '제2조 정의' 처럼 괄호 없이 제목이 그대로 이어지는 경우까지는
+        # 건드리지 않는다 — 괄호쌍이 없으면 본문과 구분할 수 없다.
+        if rest.startswith("("):
+            close = rest.find(")")
+            if close != -1:
+                return rest[close + 1 :].lstrip()
+    return content
+
+
+def _parse_ho_list(ho_list) -> list[dict]:
+    """'호' 리스트를 표준 {"번호","내용","목"} 형태로 변환한다."""
+    hos = []
+    for h in ho_list or []:
+        if not isinstance(h, dict):
+            continue
+        hnum_raw = next(
+            (strip_markup(str(x)) for kk, x in h.items() if "호번호" in kk and x), None
+        )
+        hbody_raw = next(
+            (strip_markup(str(x)) for kk, x in h.items() if "호내용" in kk and isinstance(x, str)),
+            "",
+        )
+        moks = []
+        for kk, v in h.items():
+            if "목" in kk and isinstance(v, list):
+                for m in v:
+                    if not isinstance(m, dict):
+                        continue
+                    mnum_raw = next(
+                        (strip_markup(str(x)) for kkk, x in m.items() if "목번호" in kkk and x),
+                        None,
+                    )
+                    mbody_raw = next(
+                        (
+                            strip_markup(str(x))
+                            for kkk, x in m.items()
+                            if "목내용" in kkk and isinstance(x, str)
+                        ),
+                        "",
+                    )
+                    moks.append(
+                        {
+                            "번호": _clean_num(mnum_raw),
+                            "내용": _strip_own_marker(mbody_raw, mnum_raw).strip(),
+                        }
+                    )
+        hos.append(
+            {
+                "번호": _clean_num(hnum_raw),
+                "내용": _strip_own_marker(hbody_raw, hnum_raw).strip(),
+                "목": moks,
+            }
+        )
+    return hos
+
+
+def _parse_para_list(para_val) -> list[dict]:
+    """'항' 값(리스트 또는 단일 dict)을 표준 paragraph 리스트로 변환한다.
+
+    항이 여러 개면 리스트로 오지만, 항 구분 없이 바로 호부터 시작하는
+    조문(예: 정의 조항)은 '항' 자체가 {"호": [...]} 형태의 단일 dict로 온다.
+    이 경우를 list 로만 처리하면 안의 호 항목이 통째로 사라진다
+    (실제로 겪은 버그 — 「식품위생법」 제2조 정의의 호 9개가 전부 유실됐었다).
+    """
+    if isinstance(para_val, dict):
+        ho_list = para_val.get("호")
+        if isinstance(ho_list, list):
+            return [{"번호": None, "내용": "", "호": _parse_ho_list(ho_list)}]
+        para_val = [para_val]
+
+    paras = []
+    for p in para_val or []:
+        if not isinstance(p, dict):
+            continue
+        pnum_raw = next(
+            (str(x) for kk, x in p.items() if "번호" in kk and isinstance(x, str) and x), None
+        )
+        pbody_raw = next(
+            (strip_markup(str(x)) for kk, x in p.items() if "내용" in kk and isinstance(x, str)),
+            "",
+        )
+        ho_list = p.get("호") if isinstance(p.get("호"), list) else None
+        paras.append(
+            {
+                "번호": pnum_raw,
+                "내용": _strip_own_marker(pbody_raw, pnum_raw).strip(),
+                "호": _parse_ho_list(ho_list) if ho_list else [],
+            }
+        )
+    return paras
+
+
 def extract_articles(detail: dict) -> list[dict]:
     """상세 JSON에서 조문 트리를 뽑는다.
 
@@ -324,42 +478,123 @@ def extract_articles(detail: dict) -> list[dict]:
     if units:
         out = []
         for u in units:
+            # '전문' 등 조문이 아닌 장/절 표제 항목은 제외한다. 실제로 겪은
+            # 버그: "제1장 총칙" 이 조문번호="1" 을 공유해 가짜 제1조로 잡혔다.
+            status = next((v for kk, v in u.items() if "조문여부" in kk), None)
+            if status not in (None, "", "조문"):
+                continue
+
             def g(*needles, default=""):
                 for k, v in u.items():
                     if any(n in k for n in needles) and isinstance(v, str):
                         return strip_markup(v).strip()
                 return default
 
-            paras = []
+            num = g("조문번호", default=None) or None
+            branch_raw = g("조문가지번호", default=None)
+            # "0" 은 '가지 없음' 을 뜻하는 값이지 진짜 가지번호가 아니다.
+            # 이걸 그대로 두면 truthy 라서 "제5조의0" 같은 존재하지 않는
+            # 조문이 생긴다 — 별표번호(0패딩)·부서명 우선순위에서 이미
+            # 겪은 것과 같은 종류의 "문자열이라 falsy 검사가 안 먹는" 버그.
+            branch = branch_raw if branch_raw not in (None, "", "0") else None
+            title = g("조문제목", default=None) or None
+
+            paras: list[dict] = []
             for k, v in u.items():
-                if k.startswith("항") and isinstance(v, list):
-                    for p in v:
-                        if not isinstance(p, dict):
-                            continue
-                        pnum = next(
-                            (strip_markup(str(x)) for kk, x in p.items() if "번호" in kk), None
-                        )
-                        pbody = next(
-                            (strip_markup(str(x)) for kk, x in p.items() if "내용" in kk), ""
-                        )
-                        paras.append({"번호": pnum, "내용": pbody.strip(), "호": []})
+                if k.startswith("항"):
+                    paras = _parse_para_list(v)
+                    break
+
             out.append(
                 {
-                    "번호": g("조문번호", default=None) or None,
-                    "가지": g("조문가지번호", default=None) or None,
-                    "제목": g("조문제목", default=None) or None,
-                    "내용": g("조문내용"),
+                    "번호": num,
+                    "가지": branch,
+                    "제목": title,
+                    "내용": _strip_article_head(g("조문내용"), num, branch, title),
                     "항": paras,
                 }
             )
         return out
 
-    blobs = []
+    return _extract_from_text_blobs(detail)
+
+
+# 조문 본문이 아닌 필드는 '내용' 이 들어가도 blob 수집에서 제외한다.
+# 실제로 겪은 문제: '부칙내용' 필드(수십 년치 개정이력 텍스트)가 이
+# 제외 목록 없이 조문 blob 과 함께 수집돼, 부칙 앞부분이 번호 없는
+# 가짜 조문으로 둔갑했다(자치법규 target=ordin 에서 재현).
+_BLOB_EXCLUDE = ("부칙", "제개정이유", "관련")
+
+
+def _extract_from_text_blobs(detail: dict) -> list[dict]:
+    """구조화된 조문단위가 없을 때, 텍스트 blob 을 모아 정규식으로 파싱한다.
+
+    두 가지를 추가로 처리한다:
+    1) 조문내용이 문자열이 아니라 '조별 문자열의 리스트' 로 오는 응답이
+       있다(여러 부처의 admrul 상세에서 확인) — 그대로 두면
+       isinstance(v, str) 검사에 걸려 통째로 무시되고 "본문이 비어
+       있다" 는 잘못된 안내가 나간다. 리스트면 줄바꿈으로 합쳐 하나의
+       blob 취급한다.
+    2) 그래도 정규식이 "제N조" 구조를 하나도 못 찾았는데 원문 텍스트
+       자체는 충분히 긴 경우(예: "Ⅰ.총칙 1.목적 가. ..." 같은 개요식
+       고시 본문 — 「식품등의 표시기준」실제 사례), 빈 리스트를 돌려주면
+       "본문이 비어 있다" 는 완전히 틀린 메시지가 나간다. 이럴 땐 구조를
+       억지로 지어내지 않고, 번호 없는 원문 그대로를 조문 하나로 감싸
+       돌려준다 — 있는 내용을 없다고 하지 않는 것이 우선이다.
+    """
+    # 1순위: 실제로 확인된 조문 본문 필드명과 정확히 일치하면 길이 제한 없이
+    # 그대로 믿는다. 짧아도(예: "이 조례 시행에 필요한 사항은 규칙으로
+    # 정한다" — 37자) 진짜 조문이면 온전히 살려야 한다 — 아래 2순위의
+    # 길이 임계값(>40자)을 여기에도 적용하면 짧고 정상적인 조문이
+    # 통째로 빠진다(실제로 겪은 문제, 자치법규 제11조).
+    _EXACT_BODY_KEYS = ("조문내용", "조내용")
+    blobs: list[str] = []
     for d in _iter_dicts(detail):
         for k, v in d.items():
-            if isinstance(v, str) and ("조문" in k or "내용" in k) and len(v) > 40:
+            if k in _EXACT_BODY_KEYS and isinstance(v, str) and v.strip():
                 blobs.append(v)
-    return parse_articles("\n".join(blobs)) if blobs else []
+            elif (
+                k in _EXACT_BODY_KEYS
+                and isinstance(v, list)
+                and v
+                and all(isinstance(x, str) for x in v)
+            ):
+                blobs.append("\n".join(x for x in v if x))
+
+    # 2순위: 정확히 일치하는 필드가 없으면(아직 못 본 target 형태 등),
+    # '조문'/'내용' 이 들어간 필드를 넓게 훑되 — 넓게 훑는 만큼 길이
+    # 임계값으로 짧은 메타데이터(코드·번호 리스트 등)를 걸러낸다.
+    # 실제로 "조문번호":["000100","000100"] 같은 코드 리스트가 '조문'
+    # 부분문자열에 걸려 유령 조문으로 샌 적이 있다.
+    if not blobs:
+        for d in _iter_dicts(detail):
+            for k, v in d.items():
+                if any(x in k for x in _BLOB_EXCLUDE):
+                    continue
+                if isinstance(v, str) and ("조문" in k or "내용" in k) and len(v) > 40:
+                    blobs.append(v)
+                elif (
+                    isinstance(v, list)
+                    and ("조문" in k or "내용" in k)
+                    and v
+                    and all(isinstance(x, str) for x in v)
+                ):
+                    joined_list = "\n".join(x for x in v if x)
+                    if len(joined_list) > 40:
+                        blobs.append(joined_list)
+
+    if not blobs:
+        return []
+
+    joined = "\n".join(blobs)
+    arts = parse_articles(break_before_circled(joined))
+    if arts:
+        return arts
+
+    raw = strip_markup(joined).strip()
+    if len(raw) > 40:
+        return [{"번호": None, "가지": None, "제목": None, "내용": raw, "항": []}]
+    return []
 
 
 def filter_articles(articles: list[dict], spec: str | None) -> list[dict]:
@@ -502,7 +737,7 @@ def articles_to_kb_entries(articles: list[dict], category: str, source: str) -> 
                 parts.append(f"{p.get('번호') or ''} {p['내용']}".strip())
             for h in p.get("호", []):
                 if h.get("내용"):
-                    parts.append(f"  {h.get('번호')}. {h['내용']}")
+                    parts.append(f"{h.get('번호')}. {h['내용']}")
         definition = " ".join(parts).strip()
         if not definition:
             continue
@@ -519,17 +754,36 @@ def articles_to_kb_entries(articles: list[dict], category: str, source: str) -> 
     return entries
 
 
+def _kb_identity(e: dict) -> tuple:
+    """지식베이스 entry 의 중복 판정 키.
+
+    term+category 만 쓰면 같은 제목의 서로 다른 조문이 하나로 뭉개진다.
+    한국 법령은 "벌칙", "정의", "위원의 신분보장" 처럼 여러 조문이 같은
+    제목을 공유하는 일이 흔하다 — 실제로 「식품위생법」에는 "벌칙"이라는
+    제목의 조문이 제93~98조까지 6개 있는데, term+category 만으로 중복
+    판정하면 5개가 조용히 덮어써져 사라진다(실제로 겪은 데이터 손실 버그).
+
+    조문에서 뽑은 entry 는 `standard` 에 조문번호("제73조")가 들어있으므로
+    그것까지 키에 포함해 서로 다른 조문임을 구분한다. 수기로 만든
+    용어집처럼 `standard` 가 없는 entry 는 기존대로 term+category 로만
+    구분한다(그 경우 용어 자체가 자연스러운 고유키이기 때문).
+    """
+    standard = e.get("standard")
+    return (e.get("term"), e.get("category"), standard) if standard else (e.get("term"), e.get("category"))
+
+
 def merge_kb(existing: dict, new_entries: list[dict]) -> tuple[dict, int, int]:
     """지식베이스 JSON 에 entry 를 병합한다. (결과, 추가수, 갱신수) 반환.
 
-    term+category 가 같으면 갱신, 없으면 추가.
+    조문번호(standard)가 있으면 term+category+standard 로, 없으면
+    term+category 로 중복을 판정해 같으면 갱신, 없으면 추가한다.
     """
     data = dict(existing) if existing else {}
     entries = list(data.get("entries", []))
-    index = {(e.get("term"), e.get("category")): i for i, e in enumerate(entries)}
+    index = {_kb_identity(e): i for i, e in enumerate(entries)}
     added = updated = 0
     for e in new_entries:
-        k = (e.get("term"), e.get("category"))
+        k = _kb_identity(e)
         if k in index:
             entries[index[k]] = e
             updated += 1

@@ -16,6 +16,7 @@ from parsers import (  # noqa: E402
     articles_to_kb_entries,
     articles_to_markdown,
     articles_to_text,
+    break_before_circled,
     byl_matches,
     byl_ref_from_item,
     extract_articles,
@@ -276,6 +277,40 @@ class TestKbExport(unittest.TestCase):
         self.assertEqual((added, updated), (0, 1))
         self.assertEqual(merged["entries"][0]["definition"], "new")
 
+    def test_merge_keeps_same_titled_articles_separate(self):
+        # 회귀 테스트: 「식품위생법」 제93~98조가 전부 "벌칙" 이라는 제목을
+        # 공유한다. term+category 만으로 중복 판정하면 5개가 조용히
+        # 덮어써져 사라진다 — 실제 실행에서 확인된 데이터 손실 버그.
+        entries = [
+            {"term": "벌칙", "category": "식품공전", "standard": f"제{n}조", "definition": f"본문{n}"}
+            for n in range(93, 99)
+        ]
+        merged, added, updated = merge_kb({}, entries)
+        self.assertEqual(added, 6)
+        self.assertEqual(updated, 0)
+        self.assertEqual(len(merged["entries"]), 6)
+        standards = {e["standard"] for e in merged["entries"]}
+        self.assertEqual(standards, {f"제{n}조" for n in range(93, 99)})
+
+    def test_merge_still_updates_same_article_on_rerun(self):
+        # 같은 조문(standard 동일)을 다시 내보내면 갱신이어야지 새로 추가되면 안 된다
+        first = [{"term": "벌칙", "category": "식품공전", "standard": "제93조", "definition": "old"}]
+        merged, _, _ = merge_kb({}, first)
+        second = [{"term": "벌칙", "category": "식품공전", "standard": "제93조", "definition": "new"}]
+        merged, added, updated = merge_kb(merged, second)
+        self.assertEqual((added, updated), (0, 1))
+        self.assertEqual(len(merged["entries"]), 1)
+        self.assertEqual(merged["entries"][0]["definition"], "new")
+
+    def test_merge_without_standard_falls_back_to_term_category(self):
+        # 수기로 만든 용어집처럼 standard 가 없는 entry는 기존 동작(term+category) 유지
+        existing = {"entries": [{"term": "과자", "category": "식품공전", "definition": "old"}]}
+        merged, added, updated = merge_kb(
+            existing, [{"term": "과자", "category": "식품공전", "definition": "new"}]
+        )
+        self.assertEqual((added, updated), (0, 1))
+        self.assertEqual(merged["entries"][0]["definition"], "new")
+
     def test_merge_into_empty(self):
         merged, added, updated = merge_kb({}, [{"term": "a", "category": "c"}])
         self.assertEqual((added, updated), (1, 0))
@@ -302,6 +337,316 @@ class TestCacheKey(unittest.TestCase):
         a = Cache.key("https://x/y", {"query": "식품", "display": 20})
         b = Cache.key("https://x/y", {"display": 20, "query": "식품"})
         self.assertEqual(a, b)
+
+
+# 실제 lawService.do(target=law, ID=001805 「식품위생법」) 응답에서 그대로
+# 옮긴 픽스처(첫 4개 조문단위, OC=test 로 조회). 세 가지 함정을 담고 있다:
+#   1) 조문여부="전문" 인 장(章) 표제가 진짜 조문과 같은 조문번호를 공유한다
+#   2) 항내용/호내용에 번호가 이미 박혀 있다("① 누구든지...", '1. "식품"...')
+#   3) 항이 하나뿐이면(정의 조항처럼) '항' 자체가 {"호":[...]} 단일 dict로 온다
+REAL_LAW_DETAIL = {
+    "법령": {
+        "조문": {
+            "조문단위": [
+                {
+                    "조문번호": "1",
+                    "조문내용": "                        제1장 총칙",
+                    "조문여부": "전문",
+                },
+                {
+                    "조문번호": "1",
+                    "조문내용": (
+                        "제1조(목적) 이 법은 식품으로 인하여 생기는 위생상의 위해(危害)를 "
+                        "방지하고 식품영양의 질적 향상을 도모하며 식품에 관한 올바른 정보를 "
+                        "제공함으로써 국민 건강의 보호ㆍ증진에 이바지함을 목적으로 한다."
+                    ),
+                    "조문제목": "목적",
+                    "조문여부": "조문",
+                },
+                {
+                    "조문번호": "2",
+                    "항": {
+                        "호": [
+                            {"호번호": "1.", "호내용": '1. "식품"이란 모든 음식물을 말한다.'},
+                            {
+                                "호번호": "5의2.",
+                                "호내용": '5의2. "공유주방"이란 여러 영업자가 함께 사용하는 장소를 말한다.',
+                            },
+                        ]
+                    },
+                    "조문내용": "제2조(정의) 이 법에서 사용하는 용어의 뜻은 다음과 같다.",
+                    "조문제목": "정의",
+                    "조문여부": "조문",
+                },
+                {
+                    "조문번호": "3",
+                    "항": [
+                        {
+                            "항번호": "①",
+                            "항내용": "① 누구든지 판매를 목적으로 식품을 위생적으로 취급하여야 한다.",
+                        },
+                        {
+                            "항번호": "②",
+                            "항내용": "② 영업에 사용하는 기구는 깨끗하고 위생적으로 다루어야 한다.",
+                        },
+                    ],
+                    "조문내용": "제3조(식품 등의 취급)",
+                    "조문제목": "식품 등의 취급",
+                    "조문여부": "조문",
+                },
+            ]
+        }
+    }
+}
+
+
+class TestRealLawDetailResponse(unittest.TestCase):
+    """실제 law 상세 응답으로 확인된 구조화 파싱 함정에 대한 회귀 테스트."""
+
+    def setUp(self):
+        self.arts = extract_articles(REAL_LAW_DETAIL)
+
+    def test_chapter_heading_excluded(self):
+        # "전문"(제1장 총칙)이 조문번호를 공유해도 별도 가짜 조문으로 잡히면 안 된다
+        self.assertEqual(len(self.arts), 3)
+        self.assertEqual([a["번호"] for a in self.arts], ["1", "2", "3"])
+
+    def test_article_content_head_stripped(self):
+        # 조문내용에 "제1조(목적)" 머리말이 중복으로 남아있으면 안 된다
+        art1 = self.arts[0]
+        self.assertFalse(art1["내용"].startswith("제1조"))
+        self.assertTrue(art1["내용"].startswith("이 법은"))
+
+    def test_dict_shaped_para_recovers_ho_items(self):
+        # 항이 단일 dict({"호":[...]})로 와도 호 항목이 유실되면 안 된다
+        art2 = self.arts[1]
+        self.assertEqual(len(art2["항"]), 1)
+        hos = art2["항"][0]["호"]
+        self.assertEqual(len(hos), 2)
+        self.assertEqual(hos[0]["번호"], "1")  # 마침표 없이 저장
+        self.assertEqual(hos[1]["번호"], "5의2")
+
+    def test_ho_content_marker_not_duplicated(self):
+        hos = self.arts[1]["항"][0]["호"]
+        self.assertFalse(hos[0]["내용"].startswith("1."))
+        self.assertTrue(hos[0]["내용"].startswith('"식품"'))
+
+    def test_list_shaped_para_still_works(self):
+        art3 = self.arts[2]
+        self.assertEqual([p["번호"] for p in art3["항"]], ["①", "②"])
+
+    def test_para_content_marker_not_duplicated(self):
+        # "① ① 누구든지..." 처럼 겹치면 안 된다
+        para = self.arts[2]["항"][0]
+        self.assertFalse(para["내용"].startswith("①"))
+        self.assertTrue(para["내용"].startswith("누구든지"))
+
+    def test_rendered_text_has_no_double_markers(self):
+        out = articles_to_text(self.arts)
+        self.assertNotIn("① ①", out)
+        self.assertNotIn("1. 1.", out)
+        self.assertNotIn("제1장", out)
+
+
+# 실제 lawService.do 응답에서 그대로 옮긴 픽스처들 (OC=test 로 조회).
+# 세 곳의 서로 다른 부처/타겟에서 확인된 함정을 담고 있다.
+
+# admrul, ID=2100000238426 (강원지방우정청 위임전결규정): 조문내용이 문자열
+# 하나가 아니라 '조문별 문자열의 리스트' 로 온다.
+REAL_ADMRUL_LIST_BODY = {
+    "AdmRulService": {
+        "조문내용": [
+            "제1조(목적) 이 규정은「행정효율과 협업촉진에 관한 규정」제10조 제2항에 따라 "
+            "강원지방우정청의 소관업무 중 일상적이고 경미한 사항에 관한 업무처리를 보조(보좌)"
+            "기관에 위임 전결하게 함으로써 권한과 책임을 분명히 하고 업무처리에 신속을 기함을 "
+            "목적으로 한다.",
+            "제2조(적용범위) 강원지방우정청의 보조(보좌)기관에 대한 위임전결사항은 다른 법령에 "
+            "별도 규정이 있는 것을 제외하고는 이 규정에 따른다.",
+            "제3조(전결권자의 구분) 이 규정에서의 전결권자는 국장, 감사관, 과장 및 담당으로 "
+            "구분한다.",
+        ]
+    }
+}
+
+# admrul, ID=2100000279014 (식품등의 표시기준): 조문내용이 "제N조" 가 아니라
+# Ⅰ./1./가. 개요식 번호로 된 53KB 단일 문자열. 줄바꿈도 전혀 없다.
+REAL_ADMRUL_OUTLINE_BODY = {
+    "AdmRulService": {
+        "조문내용": (
+            "Ⅰ. 총   칙1. 목  적이 고시는「식품 등의 표시ㆍ광고에 관한 법률」제4조 및 제5조, "
+            "같은 법 시행규칙 제5조제3항, 제5조의2 및 제6조제4항에 따라 식품, 축산물, 식품첨가물, "
+            "기구 또는 용기ㆍ포장의 표시기준에 관한 사항, 소비자 안전을 위한 주의사항 및 영양성분 "
+            "표시대상 식품의 영양표시에 관하여 필요한 사항을 규정함으로써 위생적인 취급을 도모하고 "
+            "소비자에게 정확한 정보를 제공하며 공정한 거래의 확보를 목적으로 한다.2. 구  성가. "
+            "이 고시는 총칙, 공통표시기준, 개별표시사항 및 표시기준, 별지 1 표시사항별 세부표시기준"
+        )
+    }
+}
+
+# ordin, ID=2019771 (가평군 보건소 수가 조례): 조문.조[] 형태(조문단위 아님),
+# 조내용에 줄바꿈이 전혀 없어 항이 한 줄로 뭉개진다. 부칙내용도 같은 응답에
+# 있어 조문 blob 수집기가 잘못 끌어올 위험이 있다.
+REAL_ORDIN_BODY = {
+    "자치법규정보": {
+        "부칙": {
+            "부칙내용": (
+                "부칙  이 조례는 공포한 날부터 시행한다.부칙 <2007.11.9. 조례 제1959호> "
+                "①(시행일) 이 조례는 공포한 날부터 시행한다.②(다른 조례의 개정)"
+            )
+        },
+        "조문": {
+            "조": [
+                {
+                    "조문번호": ["000100", "000100"],
+                    "조제목": "목적",
+                    "조내용": "제1조(목적) 이 조례는 진료비 및 수수료의 징수에 필요한 사항을 규정함을 목적으로 한다.",
+                    "조문여부": "Y",
+                },
+                {
+                    "조문번호": ["000800", "000800"],
+                    "조제목": "진료비 및 수수료 감면",
+                    "조내용": (
+                        "제8조(진료비 및 수수료 감면)① 보건소장은 공익상 필요로 할 경우나 특별한 "
+                        "사유가 있는 사람에 대해서는 진료비 및 수수료를 감면할 수 있다.② 제1항에 "
+                        "따른 진료비 및 수수료 전액 감면대상은 다음 각 호와 같다.1. 감염병 예방에 "
+                        "필요한 경우2. 수해 또는 재해 발생지역 주민진료 및 예방접종"
+                    ),
+                    "조문여부": "Y",
+                },
+            ]
+        },
+    }
+}
+
+
+class TestExtractArticlesRealWorldShapes(unittest.TestCase):
+    """실사용 재현 리뷰에서 실제 API 응답으로 확인된 3개 버그의 회귀 테스트."""
+
+    def test_list_shaped_body_recovers_all_articles(self):
+        # Finding 1: 조문내용이 리스트면 통째로 무시돼 0개가 나오던 버그
+        arts = extract_articles(REAL_ADMRUL_LIST_BODY)
+        self.assertEqual([a["번호"] for a in arts], ["1", "2", "3"])
+        self.assertIn("위임 전결", arts[0]["내용"])
+
+    def test_outline_body_returns_content_not_empty(self):
+        # Finding 2: "제N조" 가 아닌 개요식 본문을 빈 것처럼 보고하던 버그.
+        # 구조를 억지로 만들어내지 않고, 원문 그대로를 번호 없는 조문 하나로
+        # 돌려줘야 한다 — "본문이 비어 있다" 는 이 문서에 대해 명백히 거짓이다.
+        arts = extract_articles(REAL_ADMRUL_OUTLINE_BODY)
+        self.assertTrue(arts, "실제 53KB 본문이 있는데 빈 리스트를 반환함")
+        self.assertIsNone(arts[0]["번호"])
+        self.assertIn("총   칙", arts[0]["내용"])
+        self.assertIn("영양표시", arts[0]["내용"])
+
+    def test_ordin_shape_recovers_articles_without_buchik_contamination(self):
+        # Finding 3 (일부): 조문.조[] 형태를 인식하고, 부칙내용이 번호 없는
+        # 가짜 조문으로 섞여 들어오지 않아야 한다.
+        arts = extract_articles(REAL_ORDIN_BODY)
+        numbers = [a["번호"] for a in arts]
+        self.assertIn("1", numbers)
+        self.assertIn("8", numbers)
+        self.assertNotIn(None, numbers, "부칙내용이 번호 없는 유령 조문으로 섞여 들어옴")
+        joined_all = " ".join(a["내용"] for a in arts)
+        self.assertNotIn("공포한 날부터 시행", joined_all, "부칙 텍스트가 조문에 섞여 들어옴")
+
+    def test_ordin_shape_recovers_paragraph_structure(self):
+        # Finding 3 (일부): 줄바꿈 없는 조내용에서도 원문자(①②) 기준으로
+        # 항이 최소한 분리돼야 한다(호까지는 아니어도).
+        arts = extract_articles(REAL_ORDIN_BODY)
+        art8 = next(a for a in arts if a["번호"] == "8")
+        text = art8["내용"] if not art8["항"] else " ".join(p["내용"] for p in art8["항"])
+        # 최소 요건: 항이 아예 안 갈라져 모든 내용이 한 덩어리인 예전 버그는
+        # 벗어났는지 — 항 목록이 있으면 2개 이상이어야 한다.
+        if art8["항"]:
+            self.assertGreaterEqual(len(art8["항"]), 2)
+
+
+class TestBreakBeforeCircled(unittest.TestCase):
+    def test_inserts_newline_before_inline_marker(self):
+        out = break_before_circled("감면할 수 있다.② 제1항에 따른")
+        self.assertIn("있다.\n②", out)
+
+    def test_idempotent_on_already_separated_text(self):
+        text = "제1조\n① 첫째\n② 둘째"
+        out = break_before_circled(text)
+        self.assertEqual(out.replace("\n\n", "\n"), text)
+
+    def test_no_change_without_circled_chars(self):
+        text = "평범한 문장입니다."
+        self.assertEqual(break_before_circled(text), text)
+
+
+class TestHoWithBranchNumber(unittest.TestCase):
+    """Finding 4: 정규식 폴백 경로에서 '1의2.' 같은 가지번호 호가 앞 호에
+    잘못 흡수되던 버그."""
+
+    def test_branch_numbered_ho_recognized_separately(self):
+        text = "제10조(적용범위) 다음 각 호에 대하여 적용한다.\n1. 과자류\n1의2. 초콜릿류\n2. 캔디류\n"
+        arts = parse_articles(text)
+        hos = arts[0]["항"][0]["호"]
+        self.assertEqual([h["번호"] for h in hos], ["1", "1의2", "2"])
+
+    def test_branch_ho_content_not_merged_into_prior(self):
+        text = "제10조(적용범위) 적용한다.\n1. 과자류\n1의2. 초콜릿류\n"
+        arts = parse_articles(text)
+        hos = arts[0]["항"][0]["호"]
+        self.assertEqual(hos[0]["내용"], "과자류")
+        self.assertEqual(hos[1]["내용"], "초콜릿류")
+
+
+class TestParagraphsBeyondTwenty(unittest.TestCase):
+    """Finding 5: ㉑(21번째) 이상 원문자 항이 인식되지 않던 버그."""
+
+    def test_paragraph_21_and_22_recognized(self):
+        text = "제5조(항목) 다음과 같다.\n㉑ 스물한번째 항이다.\n㉒ 스물두번째 항이다.\n"
+        arts = parse_articles(text)
+        self.assertEqual(len(arts[0]["항"]), 2)
+        self.assertEqual(arts[0]["항"][0]["내용"], "스물한번째 항이다.")
+
+    def test_para_label_renders_beyond_twenty(self):
+        self.assertEqual(para_label(21), "㉑")
+        self.assertEqual(para_label(50), "㊿")
+
+
+class TestZeroBranchTreatedAsNone(unittest.TestCase):
+    """Finding 7: 조문가지번호="0" 이 '가지 없음' 을 뜻하는데, 문자열이라
+    truthy 라서 그대로 두면 "제5조의0" 같은 존재하지 않는 조문이 생긴다."""
+
+    def test_zero_branch_becomes_none(self):
+        detail = {
+            "법령": {
+                "조문": {
+                    "조문단위": [
+                        {
+                            "조문번호": "5",
+                            "조문가지번호": "0",
+                            "조문제목": "테스트",
+                            "조문내용": "제5조(테스트) 가지번호 0 테스트 본문입니다 40자 넘기기.",
+                        }
+                    ]
+                }
+            }
+        }
+        arts = extract_articles(detail)
+        self.assertIsNone(arts[0]["가지"])
+
+    def test_real_branch_still_recognized(self):
+        detail = {
+            "법령": {
+                "조문": {
+                    "조문단위": [
+                        {
+                            "조문번호": "5",
+                            "조문가지번호": "2",
+                            "조문제목": "테스트",
+                            "조문내용": "제5조의2(테스트) 가지번호 2 테스트 본문입니다 40자 넘기기.",
+                        }
+                    ]
+                }
+            }
+        }
+        arts = extract_articles(detail)
+        self.assertEqual(arts[0]["가지"], "2")
 
 
 class TestApiErrorEnvelope(unittest.TestCase):
@@ -339,6 +684,51 @@ class TestApiErrorEnvelope(unittest.TestCase):
 
     def test_empty_result_field_passes(self):
         self.check({"result": "", "other": 1})
+
+
+class TestTimeoutSplit(unittest.TestCase):
+    """JSON 메타데이터 호출은 짧은 타임아웃, 다운로드는 긴 타임아웃을 써야 한다.
+
+    실사용 리뷰에서 지적된 문제의 회귀 테스트: 이전에는 이 둘이 같은
+    타임아웃을 공유해서, API 가 응답 없이 걸리면(read timeout) 재시도
+    5회 × 60초 = 최악 약 5분을 기다려야 했다. 작은 JSON 조회는 짧게
+    실패하고 재시도해야, 첨부파일처럼 정말 오래 걸릴 수 있는 다운로드의
+    관대함을 해치지 않으면서도 대기시간을 줄일 수 있다.
+    """
+
+    def setUp(self):
+        import lawapi
+
+        self.lawapi = lawapi
+        self.captured_timeouts = []
+
+        def fake_request(client_self, url, params, timeout=None):
+            self.captured_timeouts.append(timeout or client_self.timeout)
+            return lawapi.Response(b'{"ok": true}', {}, False, url, "")
+
+        self._orig = lawapi.LawClient.request
+        lawapi.LawClient.request = fake_request
+
+    def tearDown(self):
+        self.lawapi.LawClient.request = self._orig
+
+    def _client(self):
+        return self.lawapi.LawClient(oc="test", use_cache=False, verbose=False)
+
+    def test_get_json_uses_short_timeout(self):
+        client = self._client()
+        client.get_json("https://x/y", {})
+        self.assertEqual(self.captured_timeouts[-1], self.lawapi.DEFAULT_JSON_TIMEOUT)
+
+    def test_json_timeout_shorter_than_download_timeout(self):
+        # read 성분 비교: json_timeout 이 다운로드용 timeout 보다 짧아야 한다
+        client = self._client()
+        self.assertLess(client.json_timeout[1], client.timeout[1])
+
+    def test_download_still_uses_long_timeout(self):
+        client = self._client()
+        client.download("https://x/y")
+        self.assertEqual(self.captured_timeouts[-1], self.lawapi.DEFAULT_TIMEOUT)
 
 
 class TestCacheEvict(unittest.TestCase):

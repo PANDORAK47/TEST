@@ -214,8 +214,32 @@ def _field(item: dict, *needles, default=None):
     return default
 
 
-def item_name(item: dict) -> str:
-    return str(_field(item, "명", default="?"))
+# target 별 진짜 제목 필드(우선순위 순). 검색 응답에는 분류·분야 라벨처럼
+# '명'으로 끝나지만 제목이 아닌 필드도 섞여 있어, 아무 '명' 필드나 집으면
+# 틀린 값을 고를 수 있다.
+TITLE_FIELDS = {
+    "admrul": ("행정규칙명",),
+    "law": ("법령명한글", "법령명"),
+    "ordin": ("자치법규명",),
+}
+# 분류·코드성 필드는 '명'으로 끝나도 제목이 아니다. 실제로 겪은 버그:
+# ordin(자치법규) 검색에서 '자치법규분야명'("제5장 맑은도시" 같은 분류
+# 라벨)을 제목으로 잘못 골랐다 — 서로 다른 조례 수십 건이 같은 분야에
+# 속해 전부 같은 "제목"으로 나왔다.
+_NAME_FIELD_EXCLUDE = ("분야", "종류", "구분", "코드", "부처", "부서", "기관", "담당")
+
+
+def item_name(item: dict, target: str = "") -> str:
+    for needle in TITLE_FIELDS.get(target, ()):
+        v = _field(item, needle)
+        if v:
+            return str(v)
+    for k, v in item.items():
+        if isinstance(v, str) and v.strip() and k.endswith("명") and not any(
+            x in k for x in _NAME_FIELD_EXCLUDE
+        ):
+            return v.strip()
+    return "?"
 
 
 def item_seq(item: dict, target: str = "admrul") -> str | None:
@@ -291,7 +315,7 @@ def make_client(args) -> LawClient:
     )
 
 
-def pick_best_match(items: list[dict], query: str) -> tuple[dict, str]:
+def pick_best_match(items: list[dict], query: str, target: str = "") -> tuple[dict, str]:
     """검색 결과 중 질의에 가장 맞는 항목을 고른다.
 
     법제처 검색은 부분일치라 '식품등의 표시기준' 으로 찾아도
@@ -310,7 +334,7 @@ def pick_best_match(items: list[dict], query: str) -> tuple[dict, str]:
         ("부분 일치", lambda n: q in n),
     ):
         for it in items:
-            if pred(norm(item_name(it))):
+            if pred(norm(item_name(it, target))):
                 return it, label
     return items[0], "일치 없음 — 첫 결과"
 
@@ -318,14 +342,15 @@ def pick_best_match(items: list[dict], query: str) -> tuple[dict, str]:
 def resolve_seq(client: LawClient, args) -> str:
     """--query 가 있으면 검색해 가장 잘 맞는 결과의 일련번호를 쓴다."""
     if getattr(args, "query", None):
-        items = search_items(client.search(args.query, args.target, args.display))
+        payload = client.search(args.query, args.target, args.display, getattr(args, "page", 1))
+        items = search_items(payload)
         if not items:
             sys.exit(f"'{args.query}' 검색 결과가 없습니다. --target 을 확인하세요(law/admrul/ordin).")
 
-        chosen, why = pick_best_match(items, args.query)
+        chosen, why = pick_best_match(items, args.query, args.target)
         seq = item_seq(chosen, args.target)
         if not getattr(args, "quiet", False):
-            print(f"[선택] {seq}  {item_name(chosen)}  ({why})", file=sys.stderr)
+            print(f"[선택] {seq}  {item_name(chosen, args.target)}  ({why})", file=sys.stderr)
             if why != "정확히 일치" and len(items) > 1:
                 print(
                     f"  이름이 정확히 같은 결과가 없어 {len(items)}건 중에서 골랐습니다.\n"
@@ -333,7 +358,7 @@ def resolve_seq(client: LawClient, args) -> str:
                     file=sys.stderr,
                 )
                 for it in items[:5]:
-                    print(f"    {item_seq(it, args.target)}\t{item_name(it)}", file=sys.stderr)
+                    print(f"    {item_seq(it, args.target)}\t{item_name(it, args.target)}", file=sys.stderr)
         if seq is None:
             sys.exit("검색 결과에서 일련번호를 찾지 못했습니다.")
         return seq
@@ -508,9 +533,31 @@ def parse_file(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def total_count(payload) -> int | None:
+    """검색 응답의 전체 결과 건수(totalCnt)를 찾는다.
+
+    표시된 개수보다 totalCnt 가 크면 나머지는 화면에 안 보일 뿐 사라진
+    게 아니다 — 아무 신호 없이 그냥 잘려 있으면 사용자는 그 사실 자체를
+    모른다(실제로 "식품" 검색이 448건 중 20건만 보여주면서 그 사실을
+    전혀 알리지 않는 것을 확인했다).
+    """
+    if not isinstance(payload, dict) or not payload:
+        return None
+    root = next(iter(payload.values()), None)
+    if isinstance(root, dict):
+        for k, v in root.items():
+            if "totalCnt" in k or "totalCount" in k:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
 def cmd_search(args):
     client = make_client(args)
-    items = search_items(client.search(args.query, args.target, args.display))
+    payload = client.search(args.query, args.target, args.display, args.page)
+    items = search_items(payload)
     if not items:
         print("검색 결과 없음")
         return
@@ -518,7 +565,15 @@ def cmd_search(args):
         print(json.dumps(items, ensure_ascii=False, indent=2))
         return
     for it in items:
-        print(f"{item_seq(it, args.target) or '?'}\t{item_name(it)}")
+        print(f"{item_seq(it, args.target) or '?'}\t{item_name(it, args.target)}")
+    total = total_count(payload)
+    if total is not None and total > len(items) and not args.quiet:
+        shown_from = (args.page - 1) * args.display + 1
+        print(
+            f"\n[{shown_from}~{shown_from + len(items) - 1}번째 표시, 전체 {total}건] "
+            f"--page {args.page + 1} 로 다음 페이지, --display 로 더 많이 보기",
+            file=sys.stderr,
+        )
 
 
 def cmd_annexes(args):
@@ -627,6 +682,9 @@ def cmd_export(args):
         / "data"
         / CODEX_FILES[args.codex]
     )
+    if out_path.exists() and out_path.is_dir():
+        sys.exit(f"--out 에 디렉터리가 아니라 파일 경로를 지정하세요: {out_path}")
+
     existing = {}
     if out_path.exists():
         try:
@@ -784,6 +842,7 @@ def add_common(p, *, need_target=True):
     if need_target:
         p.add_argument("--target", default="admrul", help="law | admrul | ordin (기본 admrul)")
         p.add_argument("--display", type=int, default=20)
+        p.add_argument("--page", type=int, default=1, help="검색 결과 페이지(기본 1)")
     p.add_argument("--format", choices=["text", "json", "markdown"], default="text")
     p.add_argument("--no-cache", action="store_true", help="캐시를 읽지도 쓰지도 않음")
     p.add_argument("--refresh", action="store_true", help="캐시를 무시하고 새로 받아 갱신")

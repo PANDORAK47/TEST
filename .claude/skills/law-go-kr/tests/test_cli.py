@@ -140,6 +140,83 @@ class TestSearchItems(unittest.TestCase):
         self.assertEqual(search_items({}), [])
 
 
+class TestItemNameTargetAware(unittest.TestCase):
+    """실제 API 응답에서 확인된 버그: ordin(자치법규) 검색 결과의 진짜 제목은
+    '자치법규명' 인데, '명'으로 끝나는 첫 필드를 집는 방식이 '자치법규분야명'
+    (예: "제5장 맑은도시" 같은 분류 라벨)을 제목으로 잘못 골랐다. 서로 다른
+    조례 수십 건이 같은 분야에 속해 전부 같은 "제목"으로 나오는 결과였다."""
+
+    ORDIN_ITEM = {
+        "자치법규분야명": "제5장 맑은도시",
+        "자치법규명": "가평군 주차장 설치 및 관리 조례",
+        "자치법규일련번호": "1234567",
+    }
+    ADMRUL_ITEM = {"담당부서기관명": "식품의약품안전처(식품표시광고정책과)", "행정규칙명": "식품등의 표시기준"}
+    LAW_ITEM = {"법령명한글": "식품위생법", "법령약칭명": "식품위생법"}
+
+    def test_ordin_prefers_real_title_over_category_label(self):
+        self.assertEqual(item_name(self.ORDIN_ITEM, "ordin"), "가평군 주차장 설치 및 관리 조례")
+
+    def test_ordin_never_returns_category_label(self):
+        self.assertNotEqual(item_name(self.ORDIN_ITEM, "ordin"), "제5장 맑은도시")
+
+    def test_admrul_ignores_department_name(self):
+        self.assertEqual(item_name(self.ADMRUL_ITEM, "admrul"), "식품등의 표시기준")
+
+    def test_law_prefers_full_name(self):
+        self.assertEqual(item_name(self.LAW_ITEM, "law"), "식품위생법")
+
+    def test_unknown_target_falls_back_but_excludes_known_decoys(self):
+        item = {"소관부처명": "무관", "실제제목명": "진짜 제목"}
+        self.assertEqual(item_name(item, "unknown_target"), "진짜 제목")
+
+    def test_missing_name_field_returns_placeholder(self):
+        self.assertEqual(item_name({"아무값": "x"}), "?")
+
+
+class TestExportDirectoryGuard(unittest.TestCase):
+    """--out 에 디렉터리를 주면 IsADirectoryError 로 죽지 않고 안내하며 종료해야 한다.
+
+    실제 cmd_export() 를 그대로 실행하되, make_client() 만 FakeClient 를
+    돌려주도록 바꿔치기해서 네트워크 없이 실제 가드 코드 경로를 검증한다.
+    """
+
+    def test_directory_out_path_exits_cleanly(self):
+        import argparse
+
+        import law_fetch
+
+        detail = {
+            "행정규칙": {
+                "행정규칙명": "테스트 고시",
+                "조문내용": "제1조(목적) 이 고시는 디렉터리 가드 테스트를 목적으로 하며 40자를 넘기기 위한 문구를 덧붙인다.",
+            }
+        }
+        client = FakeClient(detail=detail, search_payload=ADMRUL_SEARCH)
+
+        orig_make_client = law_fetch.make_client
+        law_fetch.make_client = lambda args: client
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                args = argparse.Namespace(
+                    seq=None,
+                    query="테스트",
+                    target="admrul",
+                    display=20,
+                    codex="food",
+                    category=None,
+                    article=None,
+                    out=td,  # 파일이 아니라 디렉터리
+                    dry_run=False,
+                    quiet=True,
+                )
+                with self.assertRaises(SystemExit) as cm:
+                    law_fetch.cmd_export(args)
+                self.assertIn("디렉터리", str(cm.exception))
+        finally:
+            law_fetch.make_client = orig_make_client
+
+
 class TestItemSeqTargetAware(unittest.TestCase):
     """공식 가이드: admrul 은 ID=행정규칙일련번호, law 는 ID=법령ID.
     검색 응답에 둘 다 있어서 아무거나 집으면 본문이 비어 온다."""

@@ -34,6 +34,7 @@ DEFAULT_CACHE_DIR = Path(
 )
 DEFAULT_TTL = 24 * 3600          # 하루. 고시는 자주 안 바뀐다.
 DEFAULT_TIMEOUT = (10.0, 60.0)   # (connect, read) — 첨부 다운로드는 느릴 수 있다
+DEFAULT_JSON_TIMEOUT = (10.0, 20.0)  # 검색·상세조회는 작은 JSON 이라 짧게 잡는다
 DEFAULT_RETRIES = 4
 
 # 재시도해도 의미가 있는 상태코드(일시적 장애·레이트리밋)
@@ -221,6 +222,7 @@ class LawClient:
         ttl: int = DEFAULT_TTL,
         use_cache: bool = True,
         timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+        json_timeout: tuple[float, float] = DEFAULT_JSON_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         verbose: bool = True,
     ):
@@ -228,7 +230,8 @@ class LawClient:
             raise LawApiError("requests 패키지가 필요합니다: pip install requests")
         self.oc = resolve_oc(oc)
         self.cache = Cache(cache_dir, ttl, use_cache)
-        self.timeout = timeout
+        self.timeout = timeout          # 첨부 다운로드용(느릴 수 있음)
+        self.json_timeout = json_timeout  # 검색·상세조회용(작은 JSON, 짧게)
         self.retries = retries
         self.verbose = verbose
         self.session = requests.Session()
@@ -245,8 +248,15 @@ class LawClient:
         if self.verbose:
             print(msg, file=sys.stderr)
 
-    def request(self, url: str, params: dict) -> Response:
-        """GET 요청 + 캐시 + 재시도. 성공하면 Response, 실패하면 예외."""
+    def request(self, url: str, params: dict, timeout: tuple[float, float] | None = None) -> Response:
+        """GET 요청 + 캐시 + 재시도. 성공하면 Response, 실패하면 예외.
+
+        timeout 을 안 주면 다운로드 기본값(self.timeout, read 60s)을 쓴다.
+        JSON 메타데이터 호출(get_json)은 짧은 self.json_timeout 을 넘겨서,
+        API 가 응답 없이 걸려 있을 때 재시도 5회 × 60s(최악 ~5분)가 아니라
+        재시도 5회 × 20s(최악 ~100초) 안에 실패를 알 수 있게 한다. 첨부
+        다운로드는 파일이 커서 시간이 걸릴 수 있으므로 긴 타임아웃을 유지한다.
+        """
         key = Cache.key(url, params)
         hit = self.cache.get(key)
         if hit is not None:
@@ -255,11 +265,12 @@ class LawClient:
             self._log(f"  [캐시] {url}")
             return hit
 
+        effective_timeout = timeout or self.timeout
         last_err: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
                 r = self.session.get(
-                    url, params=params, timeout=self.timeout, allow_redirects=True
+                    url, params=params, timeout=effective_timeout, allow_redirects=True
                 )
             except Exception as exc:  # requests 예외 계층이 버전마다 달라 광범위하게 잡는다
                 if requests is not None and isinstance(
@@ -300,7 +311,7 @@ class LawClient:
         법제처는 인증 실패도 HTTP 200 + JSON 오류 봉투로 돌려주므로, 파싱에
         성공해도 내용을 한 번 더 검사한다. 오류면 캐시에서 지우고 예외를 던진다.
         """
-        resp = self.request(url, params)
+        resp = self.request(url, params, timeout=self.json_timeout)
         text = resp.text().lstrip()
 
         try:
