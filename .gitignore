@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 law_attachments/
 out/
+.claude/worktrees/
