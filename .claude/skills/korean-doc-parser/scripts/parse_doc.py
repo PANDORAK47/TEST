@@ -16,8 +16,12 @@ def parse_hwp_hwpx(path: Path) -> str:
 
     reader_cls = HWPXReader if path.suffix.lower() == ".hwpx" else HWP5Reader
     reader = reader_cls(str(path))
-    result = reader.extract()
-    return result.text
+    try:
+        return reader.extract_text()
+    finally:
+        close = getattr(reader, "close", None)
+        if callable(close):
+            close()
 
 
 def parse_docx(path: Path) -> str:

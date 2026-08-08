@@ -244,21 +244,34 @@ def item_seq(item: dict, target: str = "admrul") -> str | None:
 
 
 def detail_title(detail) -> str | None:
-    found = []
+    """상세 JSON에서 문서 제목(행정규칙명/법령명)을 찾는다.
+
+    실제 응답은 `담당부서기관명`("식품의약품안전처(식품표시광고정책과)")이
+    `행정규칙명` 보다 먼저 나온다. 그냥 '명'으로 끝나는 첫 키를 쓰면 부서명을
+    문서 제목으로 잘못 보고한다 — parsers._pick_title 에서 겪은 것과 같은
+    종류의 버그다. 정확한 필드명을 우선 찾고, 없을 때만 일반 폴백을 쓴다.
+    """
+    exact: list[str] = []
+    fallback: list[str] = []
 
     def walk(n):
         if isinstance(n, dict):
             for k, v in n.items():
-                if isinstance(v, str) and k.endswith("명") and v.strip():
-                    found.append(v.strip())
-                else:
-                    walk(v)
+                if isinstance(v, str) and v.strip():
+                    if k in ("행정규칙명", "법령명한글", "법령명"):
+                        exact.append(v.strip())
+                    elif (
+                        k.endswith("명")
+                        and not any(x in k for x in ("부처", "부서", "기관", "담당", "종류"))
+                    ):
+                        fallback.append(v.strip())
+                walk(v)
         elif isinstance(n, list):
             for i in n:
                 walk(i)
 
     walk(detail)
-    return found[0] if found else None
+    return (exact or fallback or [None])[0]
 
 
 # ---------------------------------------------------------------------------

@@ -244,6 +244,102 @@ class TestExtractAttachments(unittest.TestCase):
         self.assertEqual(extract_attachments(DETAIL_NO_LINKS), [])
 
 
+# 실제 lawService.do(target=admrul) 응답에서 그대로 옮긴 픽스처(OC=test 로 조회,
+# ID=2100000279014, 「식품등의 표시기준」). 핵심 함정 두 개:
+#   1) `별표번호`="0001".."0007" 은 별표/별지/별도 각 그룹 안의 순번일 뿐이고,
+#      진짜 번호는 `별표키`="000100" 등에 있다 (admbyl 검색 응답과 필드 의미가 다르다)
+#   2) `담당부서기관명`이 `행정규칙명`보다 먼저 나와 제목을 오인하기 쉽다
+REAL_ADMRUL_DETAIL = {
+    "AdmRulService": {
+        "행정규칙기본정보": {
+            "현행여부": "현행",
+            "담당부서기관명": "식품의약품안전처(식품표시광고정책과)",
+            "담당자명": "정샛별",
+            "행정규칙명": "식품등의 표시기준",
+            "소관부처명": "식품의약품안전처",
+        },
+        "별표": {
+            "별표단위": [
+                {
+                    "별표제목": "인삼의 유래 기본문안",
+                    "별표번호": "0001",
+                    "별표키": "000100",
+                    "별표구분": "별표",
+                    "별표가지번호": "00",
+                    "별표서식파일링크": "/LSW/flDownload.do?flSeq=164484193",
+                    "별표서식PDF파일링크": "/LSW/flDownload.do?flSeq=164484201",
+                },
+                {
+                    "별표제목": "명칭과 용도를 함께 표시하여야 하는 식품첨가물",
+                    "별표번호": "0004",
+                    "별표키": "000400",
+                    "별표구분": "별표",
+                    "별표가지번호": "00",
+                    "별표서식파일링크": "/LSW/flDownload.do?flSeq=164484225",
+                    "별표서식PDF파일링크": "/LSW/flDownload.do?flSeq=164484233",
+                },
+                {
+                    "별표제목": "표시사항별 세부표시기준",
+                    "별표번호": "0001",  # 별지 그룹의 1번째 — 별표 그룹의 0001 과 겹친다
+                    "별표키": "000100",
+                    "별표구분": "별지",
+                    "별표가지번호": "00",
+                    "별표서식파일링크": "/LSW/flDownload.do?flSeq=164484263",
+                    "별표서식PDF파일링크": "/LSW/flDownload.do?flSeq=164484323",
+                },
+                {
+                    "별표제목": "용기·포장의 주표시면 및 정보표시면 구분",
+                    "별표번호": "0001",  # 별도 그룹의 1번째 — 역시 0001 과 겹친다
+                    "별표키": "000100",
+                    "별표구분": "별도",
+                    "별표가지번호": "00",
+                    "별표서식파일링크": "/LSW/flDownload.do?flSeq=164484325",
+                    "별표서식PDF파일링크": "/LSW/flDownload.do?flSeq=164484331",
+                },
+            ]
+        },
+    }
+}
+
+
+class TestRealAdmrulDetailResponse(unittest.TestCase):
+    """실제 API 응답으로 확인된 필드 함정에 대한 회귀 테스트."""
+
+    def test_title_prefers_admrul_name_over_department(self):
+        # 담당부서기관명이 먼저 나와도 행정규칙명을 골라야 한다
+        self.assertEqual(detail_title(REAL_ADMRUL_DETAIL), "식품등의 표시기준")
+
+    def test_byl_key_overrides_decoy_byl_number(self):
+        # 별표번호("0001")는 그룹 내 순번일 뿐이다. 별표키("000100")가 진짜 번호다.
+        recs = extract_attachments(REAL_ADMRUL_DETAIL)
+        refs_by_title = {r["title"]: r["ref"] for r in recs}
+        self.assertEqual(refs_by_title["인삼의 유래 기본문안"], BylRef("별표", 1, None))
+        self.assertEqual(
+            refs_by_title["명칭과 용도를 함께 표시하여야 하는 식품첨가물"], BylRef("별표", 4, None)
+        )
+
+    def test_same_decoy_number_across_kinds_not_confused(self):
+        # 별표/별지/별도 세 그룹 모두 별표번호="0001" 이지만 종류가 다르므로
+        # 별개의 항목으로 구분되어야 한다 (겹쳐서 하나로 뭉개지면 안 된다)
+        recs = extract_attachments(REAL_ADMRUL_DETAIL)
+        refs = {r["ref"] for r in recs}
+        self.assertIn(BylRef("별표", 1, None), refs)
+        self.assertIn(BylRef("별지", 1, None), refs)
+        self.assertIn(BylRef("별도", 1, None), refs)
+
+    def test_byl_filter_finds_annex_4_by_true_number(self):
+        recs = extract_attachments(REAL_ADMRUL_DETAIL)
+        got = apply_byl_filter(recs, "별표 4")
+        self.assertTrue(got)
+        self.assertTrue(all(r["title"] == "명칭과 용도를 함께 표시하여야 하는 식품첨가물" for r in got))
+
+    def test_kind_field_name_differs_from_admbyl(self):
+        # admrul 상세는 종류 필드명이 '별표구분' (admbyl 은 '별표종류')
+        recs = extract_attachments(REAL_ADMRUL_DETAIL)
+        kinds = {r["ref"].kind for r in recs if r["ref"]}
+        self.assertEqual(kinds, {"별표", "별지", "별도"})
+
+
 class TestNestedLinkInheritsOuterContext(unittest.TestCase):
     """admrul 상세(lawService) 응답의 실제 구조: 별표번호·별표명이 있는 바깥
     항목과, 실제 파일 링크가 있는 안쪽 리스트가 분리되어 있다. 실제 실행에서

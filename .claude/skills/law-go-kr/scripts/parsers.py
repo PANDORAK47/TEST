@@ -155,9 +155,19 @@ def _pick_title(item: dict) -> str | None:
 
 
 def byl_ref_from_item(item: dict) -> BylRef | None:
-    """admbyl 응답 항목에서 별표 참조를 만든다.
+    """admbyl/admrul 응답 항목에서 별표 참조를 만든다.
 
-    `별표번호` 필드를 우선 쓰고(0 패딩 해제), 없으면 제목에서 파싱한다.
+    같은 이름 `별표번호` 가 target 마다 다른 뜻이다 (실제 응답으로 확인):
+      admbyl 검색 응답 : 별표번호="000100" → 진짜 번호 (0 패딩, /100 로 디코딩)
+      admrul 상세 응답 : 별표번호="0001"   → **그룹 내 순번일 뿐, 가짜.**
+                        진짜 번호는 별도 필드 `별표키`="000100" 에 있다.
+
+    `별표번호` 만 믿으면 admrul 상세에서 같은 고시의 별표들이 전부 1~7 그룹
+    순번으로 뒤섞여 나온다(실제로 겪은 버그 — 모든 항목이 "번호 미상"이었던
+    원인도 이것과 얽혀 있었다). `별표키` 가 있으면 그쪽을 우선한다.
+
+    종류 필드명도 다르다: admbyl 은 `별표종류`, admrul 상세는 `별표구분`
+    (값은 "별표"/"별지"/"별도" 로 동일).
     """
     if not isinstance(item, dict):
         return None
@@ -168,11 +178,11 @@ def byl_ref_from_item(item: dict) -> BylRef | None:
                 return v
         return None
 
-    raw_num = pick("별표번호")
+    raw_num = pick("별표키") or pick("별표번호")
     if raw_num is not None:
         decoded = decode_byl_number(raw_num, pick("가지번호"))
         if decoded:
-            kind_raw = str(pick("별표종류") or "별표")
+            kind_raw = str(pick("별표종류", "별표구분") or "별표")
             kind = next((k for k in BYL_KINDS if k in kind_raw), "별표")
             return BylRef(kind, decoded[0], decoded[1])
 
