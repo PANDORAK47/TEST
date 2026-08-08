@@ -53,6 +53,7 @@ from lawapi import (  # noqa: E402
     NetworkBlockedError,
 )
 from parsers import (  # noqa: E402
+    _pick_title,
     articles_to_kb_entries,
     byl_matches,
     byl_ref_from_item,
@@ -123,16 +124,29 @@ def probe_module(mod: str, _import=None) -> tuple[bool, str]:
 
 
 def _title_of(node: dict) -> str | None:
-    for k, v in node.items():
-        if isinstance(v, str) and v.strip() and ("별표명" in k or "제목" in k or k.endswith("명")):
-            return v.strip()
-    return None
+    """첨부 레코드의 표시 제목. parsers._pick_title 과 같은 우선순위를 쓴다."""
+    return _pick_title(node)
+
+
+def classify_link(key: str, url: str) -> str:
+    """링크가 내려받을 파일인지, 웹 열람용 페이지인지 가른다.
+
+    admbyl 응답은 별표 하나당 두 개를 준다:
+      별표행정규칙상세링크 → /DRF/lawService.do?...type=HTML  (열람용, 파일 아님)
+      별표서식파일링크     → /LSW/flDownload.do?flSeq=...      (실제 파일)
+    구분하지 않으면 같은 별표가 두 번 잡히고, HTML 페이지를 파일로 저장한다.
+    """
+    if "PDF" in key.upper():
+        return "PDF"
+    if "상세" in key or "type=HTML" in url:
+        return "HTML"
+    return "파일"
 
 
 def extract_attachments(payload) -> list[dict]:
     """검색/상세 JSON에서 첨부(별표·서식) 레코드를 수집한다.
 
-    반환: [{"title", "url", "ref": BylRef|None, "fmt": "PDF"|"HWP/기타"}]
+    반환: [{"title", "url", "ref": BylRef|None, "fmt": "파일"|"PDF"|"HTML"}]
     필드명이 API 버전마다 달라, (키에 링크/파일 포함) & (값이 URL/경로) 를 후보로 본다.
     """
     out: list[dict] = []
@@ -149,12 +163,7 @@ def extract_attachments(payload) -> list[dict]:
                         continue
                     seen.add(url)
                     out.append(
-                        {
-                            "title": title or k,
-                            "url": url,
-                            "ref": ref,
-                            "fmt": "PDF" if "PDF" in k.upper() else "HWP/기타",
-                        }
+                        {"title": title or k, "url": url, "ref": ref, "fmt": classify_link(k, url)}
                     )
                 else:
                     walk(v)
@@ -448,7 +457,16 @@ def cmd_attachments(args):
 
 def cmd_fetch(args):
     client = make_client(args)
-    records = apply_byl_filter(collect_attachments(client, args), args.byl)
+    records = collect_attachments(client, args)
+
+    # HTML 열람 페이지는 파일이 아니다. 기본적으로 제외한다.
+    if not args.include_html:
+        html = [r for r in records if r["fmt"] == "HTML"]
+        records = [r for r in records if r["fmt"] != "HTML"]
+        if html and not args.quiet:
+            print(f"[건너뜀] 웹 열람용 HTML 링크 {len(html)}건 (--include-html 로 포함)", file=sys.stderr)
+
+    records = apply_byl_filter(records, args.byl)
     if not records:
         print("첨부파일 링크 없음")
         return
@@ -703,6 +721,9 @@ def main():
     p.add_argument("--outdir", default="./law_attachments")
     p.add_argument("--parse", action="store_true", help="다운로드 후 텍스트 파싱")
     p.add_argument("--grep", help="파싱 결과에서 키워드 포함 줄만 출력")
+    p.add_argument(
+        "--include-html", action="store_true", help="웹 열람용 HTML 링크도 받기(기본 제외)"
+    )
     add_common(p)
     p.set_defaults(func=cmd_fetch)
 

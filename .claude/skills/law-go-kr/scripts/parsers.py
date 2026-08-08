@@ -101,11 +101,63 @@ def byl_matches(spec: BylRef, ref: BylRef | None) -> bool:
     return spec.branch == ref.branch
 
 
+def decode_byl_number(raw, branch_raw=None) -> tuple[int, int | None] | None:
+    """법제처 `별표번호` 필드를 (번호, 가지번호) 로 푼다.
+
+    실제 응답은 0 으로 채운 문자열이고 **끝 두 자리가 가지번호**다:
+
+        "000100" → 별표 1        "000400" → 별표 4
+        "000402" → 별표 4의2     "010000" → 별표 100
+
+    이걸 그대로 int 로 읽으면 별표 1 이 '별표 100' 이 되어, 번호로 찾는 기능이
+    통째로 어긋난다(실제로 겪은 버그).
+
+    자리수가 3 미만이면 패딩되지 않은 그대로의 번호로 본다.
+    별도의 가지번호 필드가 있으면 그쪽을 우선한다.
+    """
+    digits = re.sub(r"\D", "", str(raw if raw is not None else ""))
+    if not digits:
+        return None
+    value = int(digits)
+
+    if len(digits) >= 3:
+        num, branch = divmod(value, 100)
+    else:
+        num, branch = value, 0
+
+    if branch_raw not in (None, "", []):
+        bd = re.sub(r"\D", "", str(branch_raw))
+        if bd:
+            branch = int(bd)
+
+    return (num, branch or None) if num else None
+
+
+def _pick_title(item: dict) -> str | None:
+    """항목에서 '별표 제목' 을 고른다.
+
+    단순히 '명' 으로 끝나는 첫 키를 쓰면 `소관부처명`("식품의약품안전처") 같은
+    엉뚱한 값을 집는다 — 실제 응답에서 그 필드가 `별표명` 보다 앞에 온다.
+    """
+    for needle in ("별표명", "별표서식명", "서식명", "제목"):
+        for k, v in item.items():
+            if needle in k and isinstance(v, str) and v.strip():
+                return v.strip()
+    for k, v in item.items():
+        if (
+            isinstance(v, str)
+            and v.strip()
+            and k.endswith("명")
+            and not any(x in k for x in ("부처", "규칙", "법령", "기관", "종류"))
+        ):
+            return v.strip()
+    return None
+
+
 def byl_ref_from_item(item: dict) -> BylRef | None:
     """admbyl 응답 항목에서 별표 참조를 만든다.
 
-    API 가 별표번호/별표가지번호/별표종류 필드를 주면 그걸 쓰고,
-    없으면 제목 문자열에서 파싱한다.
+    `별표번호` 필드를 우선 쓰고(0 패딩 해제), 없으면 제목에서 파싱한다.
     """
     if not isinstance(item, dict):
         return None
@@ -116,19 +168,16 @@ def byl_ref_from_item(item: dict) -> BylRef | None:
                 return v
         return None
 
-    num = pick("별표번호")
-    if num is not None:
-        try:
-            branch = pick("가지번호")
-            branch_i = int(branch) if branch not in (None, "", "0") else None
-            kind = pick("별표종류") or "별표"
-            kind = next((k for k in BYL_KINDS if k in str(kind)), "별표")
-            return BylRef(kind, int(num), branch_i)
-        except (TypeError, ValueError):
-            pass
+    raw_num = pick("별표번호")
+    if raw_num is not None:
+        decoded = decode_byl_number(raw_num, pick("가지번호"))
+        if decoded:
+            kind_raw = str(pick("별표종류") or "별표")
+            kind = next((k for k in BYL_KINDS if k in kind_raw), "별표")
+            return BylRef(kind, decoded[0], decoded[1])
 
-    title = pick("별표명", "제목", "명")
-    return parse_byl_ref(str(title)) if title else None
+    title = _pick_title(item)
+    return parse_byl_ref(title) if title else None
 
 
 # ---------------------------------------------------------------------------
