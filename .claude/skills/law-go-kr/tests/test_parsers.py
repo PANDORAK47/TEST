@@ -276,6 +276,40 @@ class TestKbExport(unittest.TestCase):
         self.assertEqual((added, updated), (0, 1))
         self.assertEqual(merged["entries"][0]["definition"], "new")
 
+    def test_merge_keeps_same_titled_articles_separate(self):
+        # 회귀 테스트: 「식품위생법」 제93~98조가 전부 "벌칙" 이라는 제목을
+        # 공유한다. term+category 만으로 중복 판정하면 5개가 조용히
+        # 덮어써져 사라진다 — 실제 실행에서 확인된 데이터 손실 버그.
+        entries = [
+            {"term": "벌칙", "category": "식품공전", "standard": f"제{n}조", "definition": f"본문{n}"}
+            for n in range(93, 99)
+        ]
+        merged, added, updated = merge_kb({}, entries)
+        self.assertEqual(added, 6)
+        self.assertEqual(updated, 0)
+        self.assertEqual(len(merged["entries"]), 6)
+        standards = {e["standard"] for e in merged["entries"]}
+        self.assertEqual(standards, {f"제{n}조" for n in range(93, 99)})
+
+    def test_merge_still_updates_same_article_on_rerun(self):
+        # 같은 조문(standard 동일)을 다시 내보내면 갱신이어야지 새로 추가되면 안 된다
+        first = [{"term": "벌칙", "category": "식품공전", "standard": "제93조", "definition": "old"}]
+        merged, _, _ = merge_kb({}, first)
+        second = [{"term": "벌칙", "category": "식품공전", "standard": "제93조", "definition": "new"}]
+        merged, added, updated = merge_kb(merged, second)
+        self.assertEqual((added, updated), (0, 1))
+        self.assertEqual(len(merged["entries"]), 1)
+        self.assertEqual(merged["entries"][0]["definition"], "new")
+
+    def test_merge_without_standard_falls_back_to_term_category(self):
+        # 수기로 만든 용어집처럼 standard 가 없는 entry는 기존 동작(term+category) 유지
+        existing = {"entries": [{"term": "과자", "category": "식품공전", "definition": "old"}]}
+        merged, added, updated = merge_kb(
+            existing, [{"term": "과자", "category": "식품공전", "definition": "new"}]
+        )
+        self.assertEqual((added, updated), (0, 1))
+        self.assertEqual(merged["entries"][0]["definition"], "new")
+
     def test_merge_into_empty(self):
         merged, added, updated = merge_kb({}, [{"term": "a", "category": "c"}])
         self.assertEqual((added, updated), (1, 0))
@@ -448,6 +482,51 @@ class TestApiErrorEnvelope(unittest.TestCase):
 
     def test_empty_result_field_passes(self):
         self.check({"result": "", "other": 1})
+
+
+class TestTimeoutSplit(unittest.TestCase):
+    """JSON 메타데이터 호출은 짧은 타임아웃, 다운로드는 긴 타임아웃을 써야 한다.
+
+    실사용 리뷰에서 지적된 문제의 회귀 테스트: 이전에는 이 둘이 같은
+    타임아웃을 공유해서, API 가 응답 없이 걸리면(read timeout) 재시도
+    5회 × 60초 = 최악 약 5분을 기다려야 했다. 작은 JSON 조회는 짧게
+    실패하고 재시도해야, 첨부파일처럼 정말 오래 걸릴 수 있는 다운로드의
+    관대함을 해치지 않으면서도 대기시간을 줄일 수 있다.
+    """
+
+    def setUp(self):
+        import lawapi
+
+        self.lawapi = lawapi
+        self.captured_timeouts = []
+
+        def fake_request(client_self, url, params, timeout=None):
+            self.captured_timeouts.append(timeout or client_self.timeout)
+            return lawapi.Response(b'{"ok": true}', {}, False, url, "")
+
+        self._orig = lawapi.LawClient.request
+        lawapi.LawClient.request = fake_request
+
+    def tearDown(self):
+        self.lawapi.LawClient.request = self._orig
+
+    def _client(self):
+        return self.lawapi.LawClient(oc="test", use_cache=False, verbose=False)
+
+    def test_get_json_uses_short_timeout(self):
+        client = self._client()
+        client.get_json("https://x/y", {})
+        self.assertEqual(self.captured_timeouts[-1], self.lawapi.DEFAULT_JSON_TIMEOUT)
+
+    def test_json_timeout_shorter_than_download_timeout(self):
+        # read 성분 비교: json_timeout 이 다운로드용 timeout 보다 짧아야 한다
+        client = self._client()
+        self.assertLess(client.json_timeout[1], client.timeout[1])
+
+    def test_download_still_uses_long_timeout(self):
+        client = self._client()
+        client.download("https://x/y")
+        self.assertEqual(self.captured_timeouts[-1], self.lawapi.DEFAULT_TIMEOUT)
 
 
 class TestCacheEvict(unittest.TestCase):

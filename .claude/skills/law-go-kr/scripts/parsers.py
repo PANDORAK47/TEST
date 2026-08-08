@@ -650,17 +650,36 @@ def articles_to_kb_entries(articles: list[dict], category: str, source: str) -> 
     return entries
 
 
+def _kb_identity(e: dict) -> tuple:
+    """지식베이스 entry 의 중복 판정 키.
+
+    term+category 만 쓰면 같은 제목의 서로 다른 조문이 하나로 뭉개진다.
+    한국 법령은 "벌칙", "정의", "위원의 신분보장" 처럼 여러 조문이 같은
+    제목을 공유하는 일이 흔하다 — 실제로 「식품위생법」에는 "벌칙"이라는
+    제목의 조문이 제93~98조까지 6개 있는데, term+category 만으로 중복
+    판정하면 5개가 조용히 덮어써져 사라진다(실제로 겪은 데이터 손실 버그).
+
+    조문에서 뽑은 entry 는 `standard` 에 조문번호("제73조")가 들어있으므로
+    그것까지 키에 포함해 서로 다른 조문임을 구분한다. 수기로 만든
+    용어집처럼 `standard` 가 없는 entry 는 기존대로 term+category 로만
+    구분한다(그 경우 용어 자체가 자연스러운 고유키이기 때문).
+    """
+    standard = e.get("standard")
+    return (e.get("term"), e.get("category"), standard) if standard else (e.get("term"), e.get("category"))
+
+
 def merge_kb(existing: dict, new_entries: list[dict]) -> tuple[dict, int, int]:
     """지식베이스 JSON 에 entry 를 병합한다. (결과, 추가수, 갱신수) 반환.
 
-    term+category 가 같으면 갱신, 없으면 추가.
+    조문번호(standard)가 있으면 term+category+standard 로, 없으면
+    term+category 로 중복을 판정해 같으면 갱신, 없으면 추가한다.
     """
     data = dict(existing) if existing else {}
     entries = list(data.get("entries", []))
-    index = {(e.get("term"), e.get("category")): i for i, e in enumerate(entries)}
+    index = {_kb_identity(e): i for i, e in enumerate(entries)}
     added = updated = 0
     for e in new_entries:
-        k = (e.get("term"), e.get("category"))
+        k = _kb_identity(e)
         if k in index:
             entries[index[k]] = e
             updated += 1
