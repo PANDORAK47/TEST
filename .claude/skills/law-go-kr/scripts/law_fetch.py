@@ -1,305 +1,173 @@
 #!/usr/bin/env python3
-"""법제처 국가법령정보 OPEN API(DRF) 클라이언트.
+"""법제처 국가법령정보 OPEN API(DRF) CLI.
 
-법령/행정규칙을 검색하고, 본문에 딸린 별표·서식(첨부파일: HWP/HWPX/PDF)을
-찾아 내려받은 뒤, 필요하면 korean-doc-parser 스킬로 파싱한다.
+법령·행정규칙을 검색하고, 별표·서식 첨부파일을 번호로 콕 집어 내려받아
+파싱하고, 조문 본문을 구조화해 출력하거나 food-code-analyzer 지식베이스로
+내보낸다.
+
+계층:
+  lawapi.py   — HTTP(재시도·타임아웃·캐시·오류 구분)
+  parsers.py  — 별표 참조·조문 트리·출력 포맷(순수 함수, 테스트됨)
+  law_fetch.py— CLI 와 오케스트레이션(이 파일)
 
 전제:
-  - 환경변수 LAW_GO_KR_OC 에 법제처 OPEN API 인증키(OC, 보통 이메일 아이디)를 설정.
-    open.law.go.kr 에서 발급.  (코드/리포에는 키를 남기지 않는다.)
-  - 실행 환경이 www.law.go.kr 로 아웃바운드 HTTPS 가능해야 한다.
+  export LAW_GO_KR_OC=your_oc_id     # open.law.go.kr 에서 발급
+  실행 환경이 www.law.go.kr 로 아웃바운드 HTTPS 가능해야 한다.
 
-사용법:
-  export LAW_GO_KR_OC=your_oc_id
+주요 사용법:
+  # 검색 → 행정규칙일련번호 확인
+  law_fetch.py search "식품등의 표시기준"
 
-  # 1) 검색 → 행정규칙일련번호(ID) 확인
-  python3 law_fetch.py search "식품의 기준 및 규격" --target admrul
+  # 별표 목록 보기 (번호 인식 결과까지)
+  law_fetch.py annexes --query "식품등의 표시기준"
 
-  # 2) 첨부파일(별표) 목록만 보기
-  python3 law_fetch.py attachments 2100000279602 --target admrul
+  # '별표 4' 만 내려받아 파싱
+  law_fetch.py fetch --query "식품등의 표시기준" --byl "별표 4" --parse
 
-  # 3) 첨부파일 전부 다운로드
-  python3 law_fetch.py fetch 2100000279602 --target admrul --outdir ./out
+  # 조문 본문을 구조화해 마크다운으로
+  law_fetch.py articles --query "식품위생법" --target law --article 1-5 --format markdown
 
-  # 4) 다운로드 + 파싱(텍스트 추출) + 키워드 필터
-  python3 law_fetch.py fetch 2100000279602 --target admrul --outdir ./out \
-          --parse --grep 과자류
-
-  # 이름으로 바로 검색→다운로드
-  python3 law_fetch.py fetch --query "식품의 기준 및 규격" --target admrul --parse
+  # 지식베이스로 내보내기
+  law_fetch.py export --query "식품의 기준 및 규격" --codex food --dry-run
 """
+from __future__ import annotations
+
 import argparse
-import io
 import json
-import os
 import re
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote, parse_qs
+from urllib.parse import urljoin
 
-try:
-    import requests
-except ImportError:  # pragma: no cover
-    requests = None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-HOST = "https://www.law.go.kr"
-SEARCH_URL = HOST + "/DRF/lawSearch.do"
-SERVICE_URL = HOST + "/DRF/lawService.do"
-
-# korean-doc-parser 스킬의 파서 경로(같은 리포 기준)
-PARSER = (
-    Path(__file__).resolve().parents[2]
-    / "korean-doc-parser"
-    / "scripts"
-    / "parse_doc.py"
+from lawapi import (  # noqa: E402
+    DEFAULT_CACHE_DIR,
+    DEFAULT_RETRIES,
+    DEFAULT_TTL,
+    HOST,
+    Cache,
+    LawApiError,
+    LawClient,
+    NetworkBlockedError,
+)
+from parsers import (  # noqa: E402
+    articles_to_kb_entries,
+    byl_matches,
+    byl_ref_from_item,
+    extract_articles,
+    filter_articles,
+    merge_kb,
+    parse_byl_specs,
+    render,
 )
 
+# korean-doc-parser 스킬의 파서(같은 skills/ 아래에 있다고 가정)
+PARSER = Path(__file__).resolve().parents[2] / "korean-doc-parser" / "scripts" / "parse_doc.py"
 
-def _oc() -> str:
-    oc = os.environ.get("LAW_GO_KR_OC", "").strip()
-    if not oc:
-        sys.exit(
-            "환경변수 LAW_GO_KR_OC 가 없습니다.  open.law.go.kr 에서 OPEN API 키(OC)를 발급받아\n"
-            "  export LAW_GO_KR_OC=your_oc_id\n"
-            "로 설정한 뒤 다시 실행하세요."
-        )
-    return oc
-
-
-def _session():
-    if requests is None:
-        sys.exit("requests 패키지가 필요합니다: pip install requests")
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (compatible; law-go-kr-skill/1.0)",
-            "Accept": "application/json, */*",
-        }
-    )
-    return s
-
-
-def _get(sess, url, params, want_json=True):
-    r = sess.get(url, params=params, timeout=30, allow_redirects=True)
-    r.raise_for_status()
-    if want_json:
-        # 법제처가 text/html 로 JSON을 주는 경우가 있어 직접 파싱
-        try:
-            return r.json()
-        except Exception:
-            return json.loads(r.text)
-    return r
-
-
-def search(sess, query, target="admrul", display=20):
-    data = _get(
-        sess,
-        SEARCH_URL,
-        {"OC": _oc(), "target": target, "type": "JSON", "query": query, "display": display},
-    )
-    # 응답 최상위 키는 target 별로 다름 → 첫 dict 값에서 리스트를 찾는다
-    root = next(iter(data.values())) if isinstance(data, dict) else data
-    items = []
-    if isinstance(root, dict):
-        for v in root.values():
-            if isinstance(v, list):
-                items = v
-                break
-            if isinstance(v, dict) and any(k for k in v if "명" in k):
-                items = [v]
-                break
-    return items
-
-
-def search_annexes(sess, query, display=100):
-    """target=admbyl 로 행정규칙 별표·서식 목록을 직접 조회.
-
-    admrul 본문 파싱 경로가 별표 링크를 못 잡을 때의 대안.
-    (제목, 다운로드URL) 리스트 반환.
-    """
-    data = _get(
-        sess,
-        SEARCH_URL,
-        {"OC": _oc(), "target": "admbyl", "type": "JSON", "query": query, "display": display},
-    )
-    return extract_attachment_links(data)
-
-
-def get_detail(sess, seq, target="admrul"):
-    return _get(
-        sess,
-        SERVICE_URL,
-        {"OC": _oc(), "target": target, "type": "JSON", "ID": str(seq)},
-    )
-
+# --codex 축약어 → food-code-analyzer 데이터 파일
+CODEX_FILES = {
+    "food": "food-codex.json",
+    "additives": "food-additives.json",
+    "health": "health-food-codex.json",
+    "equipment": "equipment-packaging.json",
+}
+CODEX_CATEGORY = {
+    "food": "식품공전",
+    "additives": "식품첨가물공전",
+    "health": "건강기능식품공전",
+    "equipment": "기구 및 용기·포장공전",
+}
 
 LINK_KEY_RE = re.compile(r"(링크|파일|다운로드)", re.I)
 PATH_RE = re.compile(r"^(https?://|/)")
 
 
-def extract_attachment_links(detail):
-    """상세 JSON을 재귀 탐색하여 첨부파일(별표/서식) 다운로드 링크를 수집한다.
+# ---------------------------------------------------------------------------
+# 응답에서 항목 뽑기
+# ---------------------------------------------------------------------------
 
-    필드명이 버전마다 다르므로 (키에 '링크/파일' 포함) & (값이 URL/경로) 인
-    항목을 모두 후보로 모은다.  (제목, url) 튜플 리스트를 반환.
+
+def _title_of(node: dict) -> str | None:
+    for k, v in node.items():
+        if isinstance(v, str) and v.strip() and ("별표명" in k or "제목" in k or k.endswith("명")):
+            return v.strip()
+    return None
+
+
+def extract_attachments(payload) -> list[dict]:
+    """검색/상세 JSON에서 첨부(별표·서식) 레코드를 수집한다.
+
+    반환: [{"title", "url", "ref": BylRef|None, "fmt": "PDF"|"HWP/기타"}]
+    필드명이 API 버전마다 달라, (키에 링크/파일 포함) & (값이 URL/경로) 를 후보로 본다.
     """
-    found = []
-    seen = set()
+    out: list[dict] = []
+    seen: set[str] = set()
 
-    def title_near(container):
-        if isinstance(container, dict):
-            for k, v in container.items():
-                if isinstance(v, str) and ("제목" in k or "명" in k) and v.strip():
-                    return v.strip()
-        return None
-
-    def walk(node, parent=None):
+    def walk(node):
         if isinstance(node, dict):
-            t = title_near(node)
+            title = _title_of(node)
+            ref = byl_ref_from_item(node)
             for k, v in node.items():
                 if isinstance(v, str) and LINK_KEY_RE.search(k) and PATH_RE.match(v.strip()):
                     url = urljoin(HOST, v.strip())
-                    if url not in seen:
-                        seen.add(url)
-                        found.append((t or k, url))
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    out.append(
+                        {
+                            "title": title or k,
+                            "url": url,
+                            "ref": ref,
+                            "fmt": "PDF" if "PDF" in k.upper() else "HWP/기타",
+                        }
+                    )
                 else:
-                    walk(v, node)
+                    walk(v)
         elif isinstance(node, list):
             for item in node:
-                walk(item, node)
+                walk(item)
 
-    walk(detail)
-    return found
-
-
-def _filename_from_response(resp, fallback):
-    cd = resp.headers.get("Content-Disposition", "")
-    m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd)
-    name = unquote(m.group(1)).strip('"') if m else ""
-    if name:
-        return name
-    return fallback
+    walk(payload)
+    return out
 
 
-_MAGIC = [
-    (b"%PDF", ".pdf"),
-    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", ".hwp"),  # OLE2 (hwp5/doc)
-    (b"PK\x03\x04", ".zip"),  # hwpx/docx (zip) → 내부 확인
-]
+def search_items(payload) -> list[dict]:
+    """검색 응답에서 결과 항목 리스트를 뽑는다(최상위 키가 target 마다 다름)."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict) or not payload:
+        return []
+    root = next(iter(payload.values()))
+    if isinstance(root, dict):
+        for v in root.values():
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+            if isinstance(v, dict) and any("명" in k for k in v):
+                return [v]
+    return []
 
 
-def _sniff_ext(head_bytes, blob):
-    for magic, ext in _MAGIC:
-        if head_bytes.startswith(magic):
-            if ext == ".zip":
-                try:
-                    zf = zipfile.ZipFile(io.BytesIO(blob))
-                    names = set(zf.namelist())
-                    if "mimetype" in names or any(n.startswith("Contents/") for n in names):
-                        return ".hwpx"
-                    if any(n.startswith("word/") for n in names):
-                        return ".docx"
-                except Exception:
-                    pass
-                return ".zip"
-            return ext
-    return ""
+def _field(item: dict, *needles, default=None):
+    for k, v in item.items():
+        if any(n in k for n in needles) and v not in (None, "", []):
+            return v
+    return default
 
 
-def _with_oc(url):
-    """law.go.kr /DRF/ 다운로드 링크에 OC가 없으면 붙인다."""
-    p = urlparse(url)
-    if "law.go.kr" in p.netloc and "/DRF/" in p.path:
-        q = parse_qs(p.query)
-        if "OC" not in q:
-            sep = "&" if p.query else "?"
-            return f"{url}{sep}OC={_oc()}"
-    return url
+def item_name(item: dict) -> str:
+    return str(_field(item, "명", default="?"))
 
 
-def download(sess, url, outdir, idx=0):
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    resp = _get(sess, _with_oc(url), {}, want_json=False)
-    blob = resp.content
-    # 실제 파일이 아니라 HTML 뷰어 페이지가 온 경우 경고
-    ctype = resp.headers.get("Content-Type", "").lower()
-    if blob[:16].lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml")) and "html" in ctype:
-        print(
-            f"  [경고] {url}\n"
-            "  → 파일이 아니라 HTML 뷰어 페이지가 반환됨. 이 링크는 웹 열람용일 수 있음.",
-            file=sys.stderr,
-        )
-    ext = _sniff_ext(blob[:16], blob)
-    base = _filename_from_response(resp, f"attachment_{idx}")
-    if not Path(base).suffix and ext:
-        base += ext
-    # 파일명에 경로/이상문자 제거
-    base = re.sub(r"[\\/:*?\"<>|]+", "_", base)
-    path = outdir / base
-    path.write_bytes(blob)
-    return path
+def item_seq(item: dict) -> str | None:
+    for k, v in item.items():
+        if ("일련번호" in k or k.endswith("ID")) and v:
+            return str(v)
+    return None
 
 
-def parse_file(path):
-    if not PARSER.exists():
-        return f"[파서 없음: {PARSER}]"
-    r = subprocess.run(
-        [sys.executable, str(PARSER), str(path)],
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        return f"[파싱 실패] {r.stderr.strip()}"
-    return r.stdout
-
-
-def cmd_search(args):
-    sess = _session()
-    items = search(sess, args.query, args.target, args.display)
-    if not items:
-        print("검색 결과 없음")
-        return
-    for it in items:
-        name = next((v for k, v in it.items() if "명" in k and isinstance(v, str)), "?")
-        seq = next(
-            (v for k, v in it.items() if ("일련번호" in k or k.endswith("ID")) and v),
-            "?",
-        )
-        print(f"{seq}\t{name}")
-
-
-def cmd_attachments(args):
-    sess = _session()
-    detail = get_detail(sess, args.seq, args.target)
-    links = extract_attachment_links(detail)
-    if not links:
-        print("첨부파일(별표/서식) 링크를 찾지 못함. 원문에 본문 조문만 있을 수 있음.")
-        return
-    for title, url in links:
-        print(f"{title}\t{url}")
-
-
-def _resolve_seq(sess, args):
-    if getattr(args, "query", None):
-        items = search(sess, args.query, args.target, args.display)
-        if not items:
-            sys.exit("검색 결과 없음")
-        it = items[0]
-        seq = next(
-            (v for k, v in it.items() if ("일련번호" in k or k.endswith("ID")) and v),
-            None,
-        )
-        name = next((v for k, v in it.items() if "명" in k and isinstance(v, str)), "?")
-        print(f"[선택] {seq}  {name}", file=sys.stderr)
-        return seq
-    return args.seq
-
-
-def _title_of(detail):
-    """상세 JSON에서 법령/규칙 명을 찾아 반환."""
+def detail_title(detail) -> str | None:
     found = []
 
     def walk(n):
@@ -317,70 +185,406 @@ def _title_of(detail):
     return found[0] if found else None
 
 
-def cmd_fetch(args):
-    sess = _session()
+# ---------------------------------------------------------------------------
+# 오케스트레이션
+# ---------------------------------------------------------------------------
+
+
+def make_client(args) -> LawClient:
+    return LawClient(
+        oc=getattr(args, "oc", None),
+        cache_dir=Path(getattr(args, "cache_dir", DEFAULT_CACHE_DIR)),
+        ttl=-1 if getattr(args, "ttl", DEFAULT_TTL) is None else args.ttl,
+        use_cache=not getattr(args, "no_cache", False) and not getattr(args, "refresh", False),
+        timeout=(getattr(args, "connect_timeout", 10.0), getattr(args, "read_timeout", 60.0)),
+        retries=getattr(args, "retries", DEFAULT_RETRIES),
+        verbose=not getattr(args, "quiet", False),
+    )
+
+
+def resolve_seq(client: LawClient, args) -> str:
+    """--query 가 있으면 검색해서 첫 결과의 일련번호를 쓴다."""
+    if getattr(args, "query", None):
+        items = search_items(client.search(args.query, args.target, args.display))
+        if not items:
+            sys.exit(f"'{args.query}' 검색 결과가 없습니다. --target 을 확인하세요(law/admrul/ordin).")
+        seq = item_seq(items[0])
+        if not getattr(args, "quiet", False):
+            print(f"[선택] {seq}  {item_name(items[0])}", file=sys.stderr)
+        if seq is None:
+            sys.exit("검색 결과에서 일련번호를 찾지 못했습니다.")
+        return seq
+    if not getattr(args, "seq", None):
+        sys.exit("일련번호(seq) 또는 --query 중 하나가 필요합니다.")
+    return args.seq
+
+
+def collect_attachments(client: LawClient, args) -> list[dict]:
+    """--via 에 따라 별표 목록을 모은다. detail 이 비면 admbyl 로 폴백."""
     if args.via == "admbyl":
         query = args.query or args.seq
-        links = search_annexes(sess, query)
-    else:
-        seq = _resolve_seq(sess, args)
-        detail = get_detail(sess, seq, args.target)
-        links = extract_attachment_links(detail)
-        if not links:
-            # 본문에서 못 찾으면 별표 직접 조회로 폴백
-            fallback_q = args.query or _title_of(detail) or str(seq)
-            print(f"[폴백] target=admbyl 로 별표 직접 조회: {fallback_q}", file=sys.stderr)
-            links = search_annexes(sess, fallback_q)
-    if not links:
+        return extract_attachments(client.search(query, "admbyl", display=100))
+
+    seq = resolve_seq(client, args)
+    detail = client.service(seq, args.target)
+    records = extract_attachments(detail)
+    if not records:
+        fallback = args.query or detail_title(detail) or str(seq)
+        print(f"[폴백] 본문에 별표 링크가 없어 admbyl 로 직접 조회: {fallback}", file=sys.stderr)
+        records = extract_attachments(client.search(fallback, "admbyl", display=100))
+    return records
+
+
+def apply_byl_filter(records: list[dict], spec: str | None) -> list[dict]:
+    """--byl 지정에 맞는 별표만 남긴다. 못 찾으면 있는 목록을 보여주고 종료."""
+    if not spec:
+        return records
+    specs = parse_byl_specs(spec)
+    kept = [r for r in records if any(byl_matches(s, r["ref"]) for s in specs)]
+    if not kept:
+        available = sorted({r["ref"].label() for r in records if r["ref"]})
+        sys.exit(
+            f"'{spec}' 에 해당하는 별표를 찾지 못했습니다.\n"
+            f"  인식된 별표: {', '.join(available) if available else '(번호를 식별할 수 없음)'}\n"
+            "  전체 목록은 `annexes` 명령으로 확인하세요."
+        )
+    return kept
+
+
+def safe_filename(name: str) -> str:
+    """경로 구분자·금지문자를 치환한다. 알맹이가 없으면 기본 이름을 쓴다."""
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", name or "").strip()
+    return cleaned if cleaned.strip("_. ") else "attachment"
+
+
+_MAGIC = [(b"%PDF", ".pdf"), (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", ".hwp"), (b"PK\x03\x04", ".zip")]
+
+
+def sniff_ext(blob: bytes) -> str:
+    import io
+    import zipfile
+
+    for magic, ext in _MAGIC:
+        if blob.startswith(magic):
+            if ext != ".zip":
+                return ext
+            try:
+                names = set(zipfile.ZipFile(io.BytesIO(blob)).namelist())
+            except Exception:
+                return ".zip"
+            if "mimetype" in names or any(n.startswith("Contents/") for n in names):
+                return ".hwpx"
+            if any(n.startswith("word/") for n in names):
+                return ".docx"
+            return ".zip"
+    return ""
+
+
+def download_record(
+    client: LawClient, rec: dict, outdir: Path, idx: int, taken: set[str] | None = None
+) -> Path:
+    resp = client.download(rec["url"])
+    blob = resp.content
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if blob[:16].lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml")) and "html" in ctype:
+        print(
+            f"  [경고] 파일이 아니라 HTML 뷰어 페이지가 반환됨: {rec['url']}",
+            file=sys.stderr,
+        )
+
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd)
+    from urllib.parse import unquote
+
+    base = unquote(m.group(1)).strip('"') if m else ""
+    if not base:
+        label = rec["ref"].label() if rec["ref"] else f"attachment_{idx}"
+        base = f"{label}_{safe_filename(rec['title'])[:40]}"
+    if not Path(base).suffix:
+        base += sniff_ext(blob[:16]) or ""
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    name = safe_filename(base)
+    # 한 번의 실행 안에서 이름이 겹치면(예: 같은 별표의 HWP/PDF) 덮어쓰지 않는다.
+    if taken is not None and name in taken:
+        stem, suffix = Path(name).stem, Path(name).suffix
+        n = 2
+        while f"{stem}({n}){suffix}" in taken:
+            n += 1
+        name = f"{stem}({n}){suffix}"
+    if taken is not None:
+        taken.add(name)
+
+    path = outdir / name
+    path.write_bytes(blob)
+    return path
+
+
+def parse_file(path: Path) -> str:
+    if not PARSER.exists():
+        return f"[파서 없음: {PARSER}] korean-doc-parser 스킬을 함께 설치하세요."
+    r = subprocess.run([sys.executable, str(PARSER), str(path)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"[파싱 실패] {r.stderr.strip()}"
+    return r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 서브커맨드
+# ---------------------------------------------------------------------------
+
+
+def cmd_search(args):
+    client = make_client(args)
+    items = search_items(client.search(args.query, args.target, args.display))
+    if not items:
+        print("검색 결과 없음")
+        return
+    if args.format == "json":
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return
+    for it in items:
+        print(f"{item_seq(it) or '?'}\t{item_name(it)}")
+
+
+def cmd_annexes(args):
+    client = make_client(args)
+    records = collect_attachments(client, args)
+    if not records:
+        print("별표·서식 첨부가 없습니다.")
+        return
+    records = apply_byl_filter(records, args.byl)
+    if args.format == "json":
+        print(
+            json.dumps(
+                [{**r, "ref": r["ref"].to_dict() if r["ref"] else None} for r in records],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    for r in records:
+        label = r["ref"].label() if r["ref"] else "(번호 미상)"
+        print(f"{label}\t[{r['fmt']}]\t{r['title']}\t{r['url']}")
+
+
+def cmd_attachments(args):
+    """하위 호환: 일련번호로 첨부 링크만 나열."""
+    client = make_client(args)
+    records = extract_attachments(client.service(args.seq, args.target))
+    if not records:
+        print("첨부파일(별표/서식) 링크를 찾지 못함. 본문 조문만 있을 수 있습니다.")
+        return
+    for r in records:
+        print(f"{r['title']}\t{r['url']}")
+
+
+def cmd_fetch(args):
+    client = make_client(args)
+    records = apply_byl_filter(collect_attachments(client, args), args.byl)
+    if not records:
         print("첨부파일 링크 없음")
         return
-    for i, (title, url) in enumerate(links):
-        path = download(sess, url, args.outdir, i)
-        print(f"[다운로드] {title} -> {path}", file=sys.stderr)
+
+    outdir = Path(args.outdir)
+    results = []
+    taken: set[str] = set()
+    for i, rec in enumerate(records):
+        path = download_record(client, rec, outdir, i, taken)
+        label = rec["ref"].label() if rec["ref"] else "(번호 미상)"
+        print(f"[다운로드] {label} {rec['title']} -> {path}", file=sys.stderr)
+        entry = {"별표": label, "제목": rec["title"], "파일": str(path), "형식": rec["fmt"]}
         if args.parse:
             text = parse_file(path)
             if args.grep:
-                lines = [ln for ln in text.splitlines() if args.grep in ln]
-                text = "\n".join(lines) if lines else f"(‘{args.grep}’ 미포함)"
-            print(f"\n===== {title} ({path.name}) =====")
-            print(text)
+                hits = [ln for ln in text.splitlines() if args.grep in ln]
+                text = "\n".join(hits) if hits else f"('{args.grep}' 미포함)"
+            entry["본문"] = text
+        results.append(entry)
+
+    if args.format == "json":
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    elif args.parse:
+        for e in results:
+            print(f"\n===== {e['별표']} {e['제목']} ({Path(e['파일']).name}) =====")
+            print(e.get("본문", ""))
+
+
+def cmd_articles(args):
+    client = make_client(args)
+    seq = resolve_seq(client, args)
+    detail = client.service(seq, args.target)
+    articles = filter_articles(extract_articles(detail), args.article)
+    if not articles:
+        sys.exit(
+            "조문을 추출하지 못했습니다.\n"
+            "  이 고시는 본문이 비어 있고 내용이 별표 첨부파일에 있을 수 있습니다.\n"
+            "  `annexes` 또는 `fetch --byl` 로 별표를 확인하세요."
+        )
+    sys.stdout.write(render(articles, args.format, title=detail_title(detail)))
+
+
+def cmd_export(args):
+    client = make_client(args)
+    seq = resolve_seq(client, args)
+    detail = client.service(seq, args.target)
+    articles = filter_articles(extract_articles(detail), args.article)
+    if not articles:
+        sys.exit("조문을 추출하지 못해 내보낼 내용이 없습니다.")
+
+    category = args.category or CODEX_CATEGORY.get(args.codex, args.codex)
+    source = detail_title(detail) or f"법제처 {seq}"
+    entries = articles_to_kb_entries(articles, category, source)
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else Path(__file__).resolve().parents[2]
+        / "food-code-analyzer"
+        / "data"
+        / CODEX_FILES[args.codex]
+    )
+    existing = {}
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            sys.exit(f"기존 지식베이스가 올바른 JSON 이 아닙니다: {out_path}")
+
+    merged, added, updated = merge_kb(existing, entries)
+    merged.setdefault("metadata", {}).update({"name": category, "source": source})
+
+    if args.dry_run:
+        print(f"[미리보기] {out_path}")
+        print(f"  추가 {added}건 / 갱신 {updated}건")
+        for e in entries[:5]:
+            print(f"  - {e['standard'] or ''} {e['term']}: {e['definition'][:60]}...")
+        if len(entries) > 5:
+            print(f"  ... 외 {len(entries) - 5}건")
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"[저장] {out_path} — 추가 {added}건 / 갱신 {updated}건")
+
+
+def cmd_cache(args):
+    cache = Cache(Path(args.cache_dir), ttl=args.ttl if args.ttl is not None else DEFAULT_TTL)
+    if args.action == "clear":
+        print(f"캐시 {cache.clear()}개 파일 삭제: {cache.root}")
+        return
+    if not cache.root.exists():
+        print(f"캐시 없음: {cache.root}")
+        return
+    files = [p for p in cache.root.iterdir() if p.is_file() and not p.name.endswith(".hdr")]
+    total = sum(p.stat().st_size for p in cache.root.iterdir() if p.is_file())
+    print(f"위치: {cache.root}\n항목: {len(files)}개\n용량: {total / 1024:.1f} KiB\nTTL: {cache.ttl}s")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def add_common(p, *, need_target=True):
+    p.add_argument("--oc", help="법제처 OPEN API 인증키(기본: $LAW_GO_KR_OC)")
+    if need_target:
+        p.add_argument("--target", default="admrul", help="law | admrul | ordin (기본 admrul)")
+        p.add_argument("--display", type=int, default=20)
+    p.add_argument("--format", choices=["text", "json", "markdown"], default="text")
+    p.add_argument("--no-cache", action="store_true", help="캐시를 읽지도 쓰지도 않음")
+    p.add_argument("--refresh", action="store_true", help="캐시를 무시하고 새로 받아 갱신")
+    p.add_argument("--ttl", type=int, default=DEFAULT_TTL, help=f"캐시 유효기간(초, 기본 {DEFAULT_TTL})")
+    p.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    p.add_argument("--connect-timeout", type=float, default=10.0)
+    p.add_argument("--read-timeout", type=float, default=60.0)
+    p.add_argument("--quiet", "-q", action="store_true", help="진행 로그 숨김")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="법제처 국가법령정보 OPEN API 클라이언트")
+    ap = argparse.ArgumentParser(
+        description="법제처 국가법령정보 OPEN API 클라이언트",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "예시:\n"
+            '  law_fetch.py search "식품등의 표시기준"\n'
+            '  law_fetch.py annexes --query "식품등의 표시기준"\n'
+            '  law_fetch.py fetch --query "식품등의 표시기준" --byl "별표 4" --parse\n'
+            '  law_fetch.py articles --query "식품위생법" --target law --article 1-5 --format markdown\n'
+            '  law_fetch.py export --query "식품의 기준 및 규격" --codex food --dry-run\n'
+        ),
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("search", help="법령/행정규칙 검색")
     p.add_argument("query")
-    p.add_argument("--target", default="admrul", help="law | admrul | ordin ... (기본 admrul)")
-    p.add_argument("--display", type=int, default=20)
+    add_common(p)
     p.set_defaults(func=cmd_search)
 
-    p = sub.add_parser("attachments", help="첨부파일(별표/서식) 링크 목록")
-    p.add_argument("seq", help="행정규칙일련번호/법령ID")
-    p.add_argument("--target", default="admrul")
+    p = sub.add_parser("annexes", help="별표·서식 목록(번호 인식 포함)")
+    p.add_argument("seq", nargs="?")
+    p.add_argument("--query")
+    p.add_argument("--byl", help="'별표 4', '4', '별지 1', '별표 4,별표 5'")
+    p.add_argument("--via", choices=["detail", "admbyl"], default="detail")
+    add_common(p)
+    p.set_defaults(func=cmd_annexes)
+
+    p = sub.add_parser("attachments", help="[하위호환] 일련번호로 첨부 링크 나열")
+    p.add_argument("seq")
+    add_common(p)
     p.set_defaults(func=cmd_attachments)
 
-    p = sub.add_parser("fetch", help="첨부파일 다운로드(+파싱)")
-    p.add_argument("seq", nargs="?", help="행정규칙일련번호/법령ID")
+    p = sub.add_parser("fetch", help="별표 첨부 다운로드(+파싱)")
+    p.add_argument("seq", nargs="?")
     p.add_argument("--query", help="이름으로 검색해 첫 결과를 사용")
-    p.add_argument("--target", default="admrul")
-    p.add_argument("--display", type=int, default=20)
-    p.add_argument(
-        "--via",
-        choices=["detail", "admbyl"],
-        default="detail",
-        help="detail=본문 파싱해 별표링크 추출(기본) / admbyl=별표목록 직접 조회",
-    )
+    p.add_argument("--byl", help="특정 별표만: '별표 4', '4', '별표 4,별표 5'")
+    p.add_argument("--via", choices=["detail", "admbyl"], default="detail")
     p.add_argument("--outdir", default="./law_attachments")
     p.add_argument("--parse", action="store_true", help="다운로드 후 텍스트 파싱")
-    p.add_argument("--grep", help="파싱 결과에서 해당 키워드 포함 줄만 출력")
+    p.add_argument("--grep", help="파싱 결과에서 키워드 포함 줄만 출력")
+    add_common(p)
     p.set_defaults(func=cmd_fetch)
 
+    p = sub.add_parser("articles", help="조문 본문을 조/항/호/목으로 구조화")
+    p.add_argument("seq", nargs="?")
+    p.add_argument("--query")
+    p.add_argument("--article", help="'3', '3의2', '1-5', '1,3,5'")
+    add_common(p)
+    p.set_defaults(func=cmd_articles)
+
+    p = sub.add_parser("export", help="조문을 food-code-analyzer 지식베이스로 내보내기")
+    p.add_argument("seq", nargs="?")
+    p.add_argument("--query")
+    p.add_argument("--codex", choices=sorted(CODEX_FILES), default="food")
+    p.add_argument("--category", help="entry 의 category 값(기본: 공전명)")
+    p.add_argument("--article", help="특정 조문만 내보내기")
+    p.add_argument("--out", help="출력 JSON 경로(기본: food-code-analyzer/data/<codex>.json)")
+    p.add_argument("--dry-run", action="store_true", help="쓰지 않고 미리보기만")
+    add_common(p)
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("cache", help="캐시 정보 확인/삭제")
+    p.add_argument("action", choices=["info", "clear"], nargs="?", default="info")
+    p.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    p.add_argument("--ttl", type=int, default=DEFAULT_TTL)
+    p.set_defaults(func=cmd_cache)
+
     args = ap.parse_args()
-    if args.cmd == "fetch" and not args.seq and not args.query:
-        ap.error("fetch 는 seq 또는 --query 중 하나가 필요합니다")
-    args.func(args)
+    if args.cmd in ("fetch", "annexes", "articles", "export"):
+        if not getattr(args, "seq", None) and not getattr(args, "query", None):
+            ap.error(f"{args.cmd} 는 seq 또는 --query 중 하나가 필요합니다")
+
+    try:
+        args.func(args)
+    except NetworkBlockedError as e:
+        print(f"\n[차단] {e}", file=sys.stderr)
+        sys.exit(2)
+    except LawApiError as e:
+        print(f"\n[오류] {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":
